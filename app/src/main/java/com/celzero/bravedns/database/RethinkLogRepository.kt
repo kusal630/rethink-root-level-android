@@ -1,0 +1,104 @@
+/*
+ * Copyright 2020 RethinkDNS and its authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.celzero.bravedns.database
+
+import androidx.lifecycle.LiveData
+import com.celzero.bravedns.data.ConnectionSummary
+import com.celzero.bravedns.data.DataUsage
+
+class RethinkLogRepository(private val logDao: RethinkLogDao) {
+
+    suspend fun insert(log: RethinkLog) {
+        logDao.insert(log)
+    }
+
+    suspend fun insertBatch(logs: List<RethinkLog>) {
+        logDao.insertBatch(logs)
+    }
+
+    suspend fun updateBatch(summary: List<ConnectionSummary>) {
+        summary.forEach {
+            logDao.updateSummary(
+                it.connId,
+                it.pid,
+                it.rpid,
+                it.downloadBytes,
+                it.uploadBytes,
+                it.duration,
+                it.rtt,
+                it.message
+            )
+        }
+    }
+
+    suspend fun purgeLogsByDate(date: Long) {
+        logDao.purgeLogsByDate(date)
+    }
+
+    suspend fun clearAllData() {
+        logDao.clearAllData()
+    }
+
+    suspend fun clearLogsByRule(rule: String) {
+        logDao.clearLogsByRule(rule)
+    }
+
+    fun logsCount(): LiveData<Long> {
+        return logDao.logsCount()
+    }
+
+    fun getDataUsage(from: Long, to: Long): DataUsage? {
+        return logDao.getDataUsage(from, to)
+    }
+
+    suspend fun getActivityBuckets(
+        rangeStart: Long,
+        rangeEnd: Long,
+        bucketMs: Long
+    ): List<ActivityBucketRow> {
+        return logDao.getActivityBuckets(rangeStart, rangeEnd, bucketMs)
+    }
+
+    suspend fun getWindowCounts(start: Long, end: Long): WindowCountRow {
+        return logDao.getWindowCounts(start, end)
+    }
+
+    suspend fun getRethinkLogsInWindow(start: Long, end: Long, limit: Int): List<RethinkLog> {
+        return logDao.getRethinkLogsInWindow(start, end, limit)
+    }
+
+    suspend fun getAppActivity(start: Long, end: Long, limit: Int): List<AppActivityRow> {
+        return logDao.getAppActivity(start, end, limit)
+    }
+
+    suspend fun getRethinkLogsInWindowForUid(
+        start: Long,
+        end: Long,
+        uid: Int,
+        limit: Int
+    ): List<RethinkLog> {
+        return logDao.getRethinkLogsInWindowForUid(start, end, uid, limit)
+    }
+
+    suspend fun getDomainActivityForUid(
+        start: Long,
+        end: Long,
+        uid: Int,
+        limit: Int
+    ): List<DomainActivityRow> {
+        return logDao.getDomainActivityForUid(start, end, uid, limit)
+    }
+}

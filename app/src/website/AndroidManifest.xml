@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Firebase (crashlytics) is scoped to the play flavor only -->
+    <!-- TODO: remove this file -->
+    <application />
+
+</manifest>
+

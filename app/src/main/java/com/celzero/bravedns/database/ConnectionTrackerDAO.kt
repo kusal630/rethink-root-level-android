@@ -1,0 +1,558 @@
+/*
+ * Copyright 2020 RethinkDNS and its authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.celzero.bravedns.database
+
+import androidx.lifecycle.LiveData
+import androidx.paging.PagingSource
+import androidx.room.Dao
+import androidx.room.Delete
+import androidx.room.Insert
+import androidx.room.OnConflictStrategy
+import androidx.room.Query
+import androidx.room.Update
+import com.celzero.bravedns.data.AppConnection
+import com.celzero.bravedns.data.DataUsage
+import com.celzero.bravedns.data.DataUsageSummary
+import com.celzero.bravedns.data.RpnConnStatsSummary
+private const val CT_COLUMNS =
+    "id, 'ct' as source, appName, uid, packageName, usrId, ipAddress, port, protocol, isBlocked, blockedByRule, blocklists, proxyDetails, flag, dnsQuery, timeStamp, connId, downloadBytes, uploadBytes, duration, synack, rpid, message, connType"
+private const val RLOG_COLUMNS =
+    "id, 'rethink' as source, appName, uid, 'com.celzero.bravedns' as packageName, usrId, ipAddress, port, protocol, isBlocked, blockedByRule, blocklists, proxyDetails, flag, dnsQuery, timeStamp, connId, downloadBytes, uploadBytes, duration, synack, rpid, message, connType"
+private const val SEARCH_PREDICATE =
+    "(appName like :query or ipAddress like :query or dnsQuery like :query or flag like :query or proxyDetails like :query or connId like :query)"
+
+// Per-arm row cap for merged (UNION ALL) queries. A compound `order by
+// timeStamp desc, id desc` cannot use indexes; without a cap SQLite scans and
+// sorts both tables in full for every page, which made NetworkLogsActivity slow
+// to open (and Room re-runs the query on every insert into either table).
+// Each arm below reads only the newest MERGE_SCAN_LIMIT rows via a reverse
+// rowid scan (`order by id desc limit N`), so the compound sort is bounded by
+// 2 * MERGE_SCAN_LIMIT rows. Logs are appended in near-chronological order, so
+// the newest N rows per arm contain the newest rows of the union. The cap
+// comfortably exceeds the paging window (pageSize 30, maxSize 180,
+// initialLoadSize 60 in ConnectionTrackerViewModel); scrolling past the cap
+// degrades to per-arm id order instead of global time order.
+private const val MERGE_SCAN_LIMIT = 2000
+
+@Dao
+interface ConnectionTrackerDAO {
+
+    @Update fun update(connectionTracker: ConnectionTracker)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    fun insert(connectionTracker: ConnectionTracker)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    fun insertBatch(connTrackerList: List<ConnectionTracker>)
+
+    // bucket aggregation for the activity wall (LogActivityAggregator);
+    // bucketIndex = (timeStamp - rangeStart) / bucketMs, grouped per blocked
+    // classification. Pass bucketMs=600000 (10 min) for the trailing-24h
+    // ten-minute wall slots.
+    @Query(
+        "select cast((timeStamp - :rangeStart)/:bucketMs as integer) as bucketIndex, isBlocked as blocked, count(id) as total from ConnectionTracker where timeStamp >= :rangeStart and timeStamp < :rangeEnd group by bucketIndex, blocked"
+    )
+    suspend fun getActivityBuckets(
+        rangeStart: Long,
+        rangeEnd: Long,
+        bucketMs: Long
+    ): List<ActivityBucketRow>
+
+    @Query(
+        "select coalesce(sum(case when isBlocked then 1 else 0 end), 0) as blocked, count(*) as total from ConnectionTracker where timeStamp >= :start and timeStamp < :end"
+    )
+    suspend fun getWindowCounts(start: Long, end: Long): WindowCountRow
+
+    @Query(
+        "select * from ConnectionTracker where timeStamp >= :start and timeStamp < :end order by id desc limit :limit"
+    )
+    suspend fun getConnectionsInWindow(start: Long, end: Long, limit: Int): List<ConnectionTracker>
+
+    @Query(
+        "select uid as uid, appName as appName, count(id) as total, sum(case when isBlocked then 1 else 0 end) as blocked from ConnectionTracker where timeStamp >= :start and timeStamp < :end group by uid, appName order by total desc limit :limit"
+    )
+    suspend fun getAppActivity(start: Long, end: Long, limit: Int): List<AppActivityRow>
+
+    // per-app data usage split by connection type and direction, ranked by
+    // total bytes; connType stores the ConnectionTracker.ConnType values
+    // ("Metered"/"Unmetered") as text; lastSeen supports recency ordering
+    @Query(
+        "select uid as uid, appName as appName, " +
+            "sum(case when connType = 'Metered' then uploadBytes else 0 end) as meteredUploadBytes, " +
+            "sum(case when connType = 'Metered' then downloadBytes else 0 end) as meteredDownloadBytes, " +
+            "sum(case when connType = 'Unmetered' then uploadBytes else 0 end) as unmeteredUploadBytes, " +
+            "sum(case when connType = 'Unmetered' then downloadBytes else 0 end) as unmeteredDownloadBytes, " +
+            "max(timeStamp) as lastSeen " +
+            "from ConnectionTracker where timeStamp >= :start and timeStamp < :end " +
+            "group by uid, appName order by (sum(uploadBytes) + sum(downloadBytes)) desc limit :limit"
+    )
+    suspend fun getTopAppsByUsage(start: Long, end: Long, limit: Int): List<AppUsageRow>
+
+    // apps ranked by blocked connection count within the window; rows are
+    // distinct events from dns-log rows, so merging with DnsLogDAO results by
+    // (uid, appName) sums the two event kinds without double counting;
+    // lastSeen is the app's most recent activity, for recency ordering
+    @Query(
+        "select uid as uid, appName as appName, sum(case when isBlocked then 1 else 0 end) as blocked, max(timeStamp) as lastSeen " +
+            "from ConnectionTracker where timeStamp >= :start and timeStamp < :end " +
+            "group by uid, appName having blocked > 0 order by blocked desc limit :limit"
+    )
+    suspend fun getTopBlockedApps(start: Long, end: Long, limit: Int): List<AppBlockedRow>
+
+    @Query(
+        "select * from ConnectionTracker where timeStamp >= :start and timeStamp < :end and uid = :uid order by id desc limit :limit"
+    )
+    suspend fun getConnectionsInWindowForUid(
+        start: Long,
+        end: Long,
+        uid: Int,
+        limit: Int
+    ): List<ConnectionTracker>
+
+    @Query(
+        "select coalesce(nullif(dnsQuery, ''), ipAddress) as label, count(id) as total, sum(case when isBlocked then 1 else 0 end) as blocked, max(timeStamp) as lastSeen, substr(max(printf('%016d', timeStamp) || flag), 17) as flag from ConnectionTracker where timeStamp >= :start and timeStamp < :end and uid = :uid group by label order by total desc limit :limit"
+    )
+    suspend fun getDomainActivityForUid(
+        start: Long,
+        end: Long,
+        uid: Int,
+        limit: Int
+    ): List<DomainActivityRow>
+
+    @Query(
+        "update ConnectionTracker set proxyDetails = :pid, rpid = :rpid, downloadBytes = :downloadBytes, uploadBytes = :uploadBytes, duration = :duration, synack = :synack, message = :message where connId = :connId"
+    )
+    fun updateSummary(
+        connId: String,
+        pid: String,
+        rpid: String, // relay proxy id
+        downloadBytes: Long,
+        uploadBytes: Long,
+        duration: Int,
+        synack: Long,
+        message: String
+    )
+
+    @Query(
+        "update ConnectionTracker set proxyDetails = :pid, rpid = :rpid, downloadBytes = :downloadBytes, uploadBytes = :uploadBytes, duration = :duration, synack = :synack, message = :message, ipAddress = :ipAddress, flag = :flag where connId = :connId"
+    )
+    fun updateSummary(
+        connId: String,
+        pid: String,
+        rpid: String,
+        downloadBytes: Long,
+        uploadBytes: Long,
+        duration: Int,
+        synack: Long,
+        message: String,
+        ipAddress: String,
+        flag: String
+    )
+
+    @Delete fun delete(connectionTracker: ConnectionTracker)
+
+    // PagingSource handles LIMIT/OFFSET; no hard-coded cap needed.
+    // Purge-by-age (PurgeConnectionLogs) bounds the table size.
+    @Query("select * from ConnectionTracker order by id desc")
+    fun getConnectionTrackerByName(): PagingSource<Int, ConnectionTracker>
+
+    @Query("select * from ConnectionTracker where uid = :uid order by id desc")
+    fun getConnectionTrackerByName(uid: Int): PagingSource<Int, ConnectionTracker>
+
+    @Query(
+        "select * from ConnectionTracker where (appName like :query or ipAddress like :query or dnsQuery like :query or flag like :query or proxyDetails like :query or connId like :query) order by id desc"
+    )
+    fun getConnectionTrackerByName(query: String): PagingSource<Int, ConnectionTracker>
+
+    @Query(
+        "select * from ConnectionTracker where uid = :uid and (appName like :query or ipAddress like :query or dnsQuery like :query or flag like :query or proxyDetails like :query or connId like :query) order by id desc"
+    )
+    fun getConnectionTrackerByName(query: String, uid: Int): PagingSource<Int, ConnectionTracker>
+
+    @Query("select * from ConnectionTracker where isBlocked = 1 order by id desc")
+    fun getBlockedConnections(): PagingSource<Int, ConnectionTracker>
+
+    @Query("select * from ConnectionTracker where uid = :uid and isBlocked = 1 order by id desc")
+    fun getBlockedConnections(uid: Int): PagingSource<Int, ConnectionTracker>
+
+    @Query(
+        "select * from ConnectionTracker where  (appName like :query or ipAddress like :query or dnsQuery like :query or flag like :query or proxyDetails like :query or connId like :query) and isBlocked = 1 order by id desc"
+    )
+    fun getBlockedConnections(query: String): PagingSource<Int, ConnectionTracker>
+
+    @Query(
+        "select * from ConnectionTracker where uid = :uid and (appName like :query or ipAddress like :query or dnsQuery like :query or flag like :query or proxyDetails like :query or connId like :query) and isBlocked = 1 order by id desc"
+    )
+    fun getBlockedConnections(query: String, uid: Int): PagingSource<Int, ConnectionTracker>
+
+    @Query(
+        "SELECT uid, ipAddress, port, COUNT(ipAddress) as count, flag as flag, 0 as blocked, GROUP_CONCAT(DISTINCT dnsQuery) as appOrDnsName, SUM(downloadBytes) as downloadBytes, SUM(uploadBytes) as uploadBytes, SUM(downloadBytes + uploadBytes) as totalBytes FROM ConnectionTracker WHERE uid = :uid and timeStamp > :to GROUP BY uid, ipAddress, port ORDER BY count DESC"
+    )
+    fun getAppIpLogs(uid: Int, to: Long): PagingSource<Int, AppConnection>
+
+    @Query(
+        "SELECT uid, ipAddress, port, COUNT(ipAddress) as count, flag as flag, 0 as blocked, '' as appOrDnsName, SUM(downloadBytes) as downloadBytes, SUM(uploadBytes) as uploadBytes, SUM(downloadBytes + uploadBytes) as totalBytes FROM ConnectionTracker WHERE uid = :uid and timeStamp > :to GROUP BY uid, ipAddress, port ORDER BY count DESC LIMIT 3"
+    )
+    fun getAppIpLogsLimited(uid: Int, to: Long): PagingSource<Int, AppConnection>
+
+    @Query(
+        "SELECT uid, ipAddress, port, COUNT(ipAddress) as count, flag as flag, 1 as blocked, '' as appOrDnsName, SUM(downloadBytes) as downloadBytes, SUM(uploadBytes) as uploadBytes, SUM(downloadBytes + uploadBytes) as totalBytes FROM ConnectionTracker WHERE uid = :uid and timeStamp > :to and isBlocked = 1 GROUP BY uid, ipAddress, port ORDER BY count DESC LIMIT 3"
+    )
+    fun getBlockedAppIpLogsLimited(uid: Int, to: Long): PagingSource<Int, AppConnection>
+
+    @Query(
+        "SELECT uid, ipAddress, port, COUNT(ipAddress) as count, flag as flag, MAX(isBlocked) as blocked, GROUP_CONCAT(DISTINCT dnsQuery) as appOrDnsName, SUM(downloadBytes) as downloadBytes, SUM(uploadBytes) as uploadBytes, SUM(downloadBytes + uploadBytes) as totalBytes FROM ConnectionTracker WHERE uid = :uid and timeStamp > :to and ipAddress like :query and (:isBlocked IS NULL OR isBlocked = :isBlocked) GROUP BY  uid, ipAddress, port ORDER BY count DESC"
+    )
+    fun getAppIpLogsFiltered(
+        uid: Int,
+        to: Long,
+        query: String,
+        isBlocked: Boolean?
+    ): PagingSource<Int, AppConnection>
+
+    @Query(
+        "select * from ConnectionTracker where blockedByRule in (:filter) and isBlocked = 1 order by id desc"
+    )
+    fun getBlockedConnectionsFiltered(filter: Set<String>): PagingSource<Int, ConnectionTracker>
+
+    @Query(
+        "select * from ConnectionTracker where protocol = :protocol order by id desc"
+    )
+    fun getProtocolFilteredConnections(protocol: String): PagingSource<Int, ConnectionTracker>
+
+    @Query(
+        "select * from ConnectionTracker where protocol = :protocol and blockedByRule in (:filter) order by id desc"
+    )
+    fun getProtocolFilteredConnections(
+        protocol: String,
+        filter: Set<String>
+    ): PagingSource<Int, ConnectionTracker>
+
+    @Query(
+        "select * from ConnectionTracker where blockedByRule in (:filter) and isBlocked = 1 and (appName like :query or ipAddress like :query or dnsQuery like :query or flag like :query or proxyDetails like :query or connId like :query) order by id desc"
+    )
+    fun getBlockedConnectionsFiltered(
+        query: String,
+        filter: Set<String>
+    ): PagingSource<Int, ConnectionTracker>
+
+    // Merged queries: UNION ALL of ConnectionTracker and RethinkLog.
+    // These are read-only display queries; inserts remain unchanged.
+    // Column list must match MergedConnectionLog in name/order.
+    // Each arm is capped to the newest MERGE_SCAN_LIMIT rows (see the constant
+    // for why) so the compound sort is bounded instead of full-table.
+
+    @Query(
+        "select * from (select $CT_COLUMNS from ConnectionTracker where isBlocked = 1 order by id desc limit $MERGE_SCAN_LIMIT) " +
+            "union all select * from (select $RLOG_COLUMNS from RethinkLog where isBlocked = 1 order by id desc limit $MERGE_SCAN_LIMIT) " +
+            "order by timeStamp desc, id desc"
+    )
+    fun getMergedBlockedConnections(): PagingSource<Int, MergedConnectionLog>
+
+    @Query(
+        "select * from (select $CT_COLUMNS from ConnectionTracker where isBlocked = 1 and $SEARCH_PREDICATE order by id desc limit $MERGE_SCAN_LIMIT) " +
+            "union all select * from (select $RLOG_COLUMNS from RethinkLog where isBlocked = 1 and $SEARCH_PREDICATE order by id desc limit $MERGE_SCAN_LIMIT) " +
+            "order by timeStamp desc, id desc"
+    )
+    fun getMergedBlockedConnections(query: String): PagingSource<Int, MergedConnectionLog>
+
+    @Query(
+        "select * from (select $CT_COLUMNS from ConnectionTracker where isBlocked = 0 order by id desc limit $MERGE_SCAN_LIMIT) " +
+            "union all select * from (select $RLOG_COLUMNS from RethinkLog where isBlocked = 0 order by id desc limit $MERGE_SCAN_LIMIT) " +
+            "order by timeStamp desc, id desc"
+    )
+    fun getMergedAllowedConnections(): PagingSource<Int, MergedConnectionLog>
+
+    @Query(
+        "select * from (select $CT_COLUMNS from ConnectionTracker where isBlocked = 0 and $SEARCH_PREDICATE order by id desc limit $MERGE_SCAN_LIMIT) " +
+            "union all select * from (select $RLOG_COLUMNS from RethinkLog where isBlocked = 0 and $SEARCH_PREDICATE order by id desc limit $MERGE_SCAN_LIMIT) " +
+            "order by timeStamp desc, id desc"
+    )
+    fun getMergedAllowedConnections(query: String): PagingSource<Int, MergedConnectionLog>
+
+    @Query(
+        "select * from (select $CT_COLUMNS from ConnectionTracker where blockedByRule in (:filter) and isBlocked = 1 order by id desc limit $MERGE_SCAN_LIMIT) " +
+            "union all select * from (select $RLOG_COLUMNS from RethinkLog where blockedByRule in (:filter) and isBlocked = 1 order by id desc limit $MERGE_SCAN_LIMIT) " +
+            "order by timeStamp desc, id desc"
+    )
+    fun getMergedBlockedConnectionsFiltered(filter: Set<String>): PagingSource<Int, MergedConnectionLog>
+
+    @Query(
+        "select * from (select $CT_COLUMNS from ConnectionTracker where blockedByRule in (:filter) and isBlocked = 1 and $SEARCH_PREDICATE order by id desc limit $MERGE_SCAN_LIMIT) " +
+            "union all select * from (select $RLOG_COLUMNS from RethinkLog where blockedByRule in (:filter) and isBlocked = 1 and $SEARCH_PREDICATE order by id desc limit $MERGE_SCAN_LIMIT) " +
+            "order by timeStamp desc, id desc"
+    )
+    fun getMergedBlockedConnectionsFiltered(
+        query: String,
+        filter: Set<String>
+    ): PagingSource<Int, MergedConnectionLog>
+
+    @Query(
+        "select * from (select $CT_COLUMNS from ConnectionTracker where blockedByRule in (:filter) and isBlocked = 0 order by id desc limit $MERGE_SCAN_LIMIT) " +
+            "union all select * from (select $RLOG_COLUMNS from RethinkLog where blockedByRule in (:filter) and isBlocked = 0 order by id desc limit $MERGE_SCAN_LIMIT) " +
+            "order by timeStamp desc, id desc"
+    )
+    fun getMergedAllowedConnectionsFiltered(filter: Set<String>): PagingSource<Int, MergedConnectionLog>
+
+    @Query(
+        "select * from (select $CT_COLUMNS from ConnectionTracker where blockedByRule in (:filter) and isBlocked = 0 and $SEARCH_PREDICATE order by id desc limit $MERGE_SCAN_LIMIT) " +
+            "union all select * from (select $RLOG_COLUMNS from RethinkLog where blockedByRule in (:filter) and isBlocked = 0 and $SEARCH_PREDICATE order by id desc limit $MERGE_SCAN_LIMIT) " +
+            "order by timeStamp desc, id desc"
+    )
+    fun getMergedAllowedConnectionsFiltered(
+        query: String,
+        filter: Set<String>
+    ): PagingSource<Int, MergedConnectionLog>
+
+    @Query(
+        "select * from (select $CT_COLUMNS from ConnectionTracker where protocol = :protocol order by id desc limit $MERGE_SCAN_LIMIT) " +
+            "union all select * from (select $RLOG_COLUMNS from RethinkLog where protocol = :protocol order by id desc limit $MERGE_SCAN_LIMIT) " +
+            "order by timeStamp desc, id desc"
+    )
+    fun getMergedProtocolFilteredConnections(protocol: String): PagingSource<Int, MergedConnectionLog>
+
+    @Query(
+        "select * from (select $CT_COLUMNS from ConnectionTracker where protocol = :protocol and blockedByRule in (:filter) order by id desc limit $MERGE_SCAN_LIMIT) " +
+            "union all select * from (select $RLOG_COLUMNS from RethinkLog where protocol = :protocol and blockedByRule in (:filter) order by id desc limit $MERGE_SCAN_LIMIT) " +
+            "order by timeStamp desc, id desc"
+    )
+    fun getMergedProtocolFilteredConnections(
+        protocol: String,
+        filter: Set<String>
+    ): PagingSource<Int, MergedConnectionLog>
+
+    @Query(
+        "select * from (select $CT_COLUMNS from ConnectionTracker order by id desc limit $MERGE_SCAN_LIMIT) " +
+            "union all select * from (select $RLOG_COLUMNS from RethinkLog order by id desc limit $MERGE_SCAN_LIMIT) " +
+            "order by timeStamp desc, id desc"
+    )
+    fun getMergedConnectionTrackerByName(): PagingSource<Int, MergedConnectionLog>
+
+    @Query(
+        "select * from (select $CT_COLUMNS from ConnectionTracker where $SEARCH_PREDICATE order by id desc limit $MERGE_SCAN_LIMIT) " +
+            "union all select * from (select $RLOG_COLUMNS from RethinkLog where $SEARCH_PREDICATE order by id desc limit $MERGE_SCAN_LIMIT) " +
+            "order by timeStamp desc, id desc"
+    )
+    fun getMergedConnectionTrackerByName(query: String): PagingSource<Int, MergedConnectionLog>
+
+    @Query("delete from ConnectionTracker") fun clearAllData()
+
+    @Query("delete from ConnectionTracker where uid = :uid") fun clearLogsByUid(uid: Int)
+
+    @Query("delete from ConnectionTracker where blockedByRule = :rule") fun clearLogsByRule(rule: String)
+
+    @Query("delete from ConnectionTracker where uid = :uid and timeStamp > :time")
+    fun clearLogsByTime(uid: Int, time: Long)
+
+    @Query("DELETE FROM ConnectionTracker WHERE  timeStamp < :date") fun purgeLogsByDate(date: Long)
+
+    @Query(
+        "select * from ConnectionTracker where isBlocked = 0 and  (appName like :query or ipAddress like :query or dnsQuery like :query or flag like :query or proxyDetails like :query or connId like :query) order by id desc"
+    )
+    fun getAllowedConnections(query: String): PagingSource<Int, ConnectionTracker>
+
+    @Query("select * from ConnectionTracker where isBlocked = 0 order by id desc")
+    fun getAllowedConnections(): PagingSource<Int, ConnectionTracker>
+
+    @Query(
+        "select * from ConnectionTracker where isBlocked = 0 and blockedByRule in (:filter) order by id desc"
+    )
+    fun getAllowedConnectionsFiltered(filter: Set<String>): PagingSource<Int, ConnectionTracker>
+
+    @Query(
+        "select * from ConnectionTracker where isBlocked = 0 and  (appName like :query or ipAddress like :query or dnsQuery like :query or flag like :query or proxyDetails like :query or connId like :query) and blockedByRule in (:filter) order by id desc"
+    )
+    fun getAllowedConnectionsFiltered(
+        query: String,
+        filter: Set<String>
+    ): PagingSource<Int, ConnectionTracker>
+
+    @Query(
+        "select 0 as uid, ipAddress as ipAddress, port as port, count(id) as count, flag, 0 as blocked, '' as appOrDnsName, SUM(downloadBytes) as downloadBytes, SUM(uploadBytes) as uploadBytes, SUM(downloadBytes + uploadBytes) as totalBytes from ConnectionTracker where isBlocked = 0 and timeStamp > :to and ipAddress != '' group by ipAddress order by count desc"
+    )
+    fun getAllContactedIps(to: Long): PagingSource<Int, AppConnection>
+
+    @Query(
+        "select 0 as uid, ipAddress as ipAddress, port as port, count(id) as count, flag, 0 as blocked, '' as appOrDnsName, SUM(downloadBytes) as downloadBytes, SUM(uploadBytes) as uploadBytes, SUM(downloadBytes + uploadBytes) as totalBytes from ConnectionTracker where  isBlocked = 0 and timeStamp > :to and ipAddress != '' group by ipAddress order by count desc LIMIT 7"
+    )
+    fun getMostContactedIps(to: Long): PagingSource<Int, AppConnection>
+
+    @Query(
+        "select 0 as uid, ipAddress as ipAddress, port as port, count(id) as count, flag, 1 as blocked, '' as appOrDnsName, SUM(downloadBytes) as downloadBytes, SUM(uploadBytes) as uploadBytes, SUM(downloadBytes + uploadBytes) as totalBytes from ConnectionTracker where isBlocked = 1 and timeStamp > :to and ipAddress != '' group by ipAddress order by count desc LIMIT 7"
+    )
+    fun getMostBlockedIps(to: Long): PagingSource<Int, AppConnection>
+
+    @Query(
+        "select 0 as uid, ipAddress as ipAddress, port as port, count(id) as count, flag, 1 as blocked, '' as appOrDnsName, SUM(downloadBytes) as downloadBytes, SUM(uploadBytes) as uploadBytes, SUM(downloadBytes + uploadBytes) as totalBytes from ConnectionTracker where isBlocked = 1 and timeStamp > :to and ipAddress != '' group by ipAddress order by count desc"
+    )
+    fun getAllBlockedIps(to: Long): PagingSource<Int, AppConnection>
+
+    @Query("select count(id) from ConnectionTracker") fun logsCount(): LiveData<Long>
+
+    @Query(
+        "select timeStamp from ConnectionTracker where id = (select min(id) from ConnectionTracker)"
+    )
+    fun getLeastLoggedTime(): Long
+
+    @Query("select connId from ConnectionTracker where uid = :uid and ipAddress = :ipAddress and timeStamp >= :to and message = '' and uploadBytes = 0 and downloadBytes = 0 and synack = 0")
+    fun getConnIdByUidIpAddress(uid: Int, ipAddress: String, to: Long): List<String>
+
+    @Query(
+        "SELECT uid, SUM(uploadBytes) AS uploadBytes, SUM(downloadBytes) AS downloadBytes FROM ConnectionTracker where timeStamp >= :from and timeStamp <= :to GROUP BY uid"
+    )
+    fun getDataUsage(from: Long, to: Long): List<DataUsage>
+
+    @Query(
+        "select sum(downloadBytes) as totalDownload, sum(uploadBytes) as totalUpload, count(id) as connectionsCount, (select sum(downloadBytes + uploadBytes) from ConnectionTracker where connType = :meteredTxt and timeStamp > :to) as meteredDataUsage from ConnectionTracker as ct where ct.timeStamp > :to"
+    )
+    fun getTotalUsages(to: Long, meteredTxt: String): DataUsageSummary
+
+    @Query("select blockedByRule from ConnectionTracker where blockedByRule in ('Rule #1B', 'Rule #1F', 'Rule #3', 'Rule #4', 'Rule #5', 'Rule #6', 'Rule #7', 'Http block', 'Universal Lockdown')")
+    fun getBlockedUniversalRulesCount(): List<String>
+
+    @Query("SELECT uid AS uid, '' AS ipAddress, 0 AS port, COUNT(id) AS count, flag AS flag, 0 AS blocked, appName AS appOrDnsName, SUM(downloadBytes) AS downloadBytes, SUM(uploadBytes) AS uploadBytes, SUM(uploadBytes + downloadBytes) AS totalBytes FROM ConnectionTracker WHERE proxyDetails like :wgId AND timeStamp > :to GROUP BY appName ORDER BY totalBytes DESC")
+    fun getWgAppNetworkActivity(wgId: String, to: Long): PagingSource<Int, AppConnection>
+
+    // last app routed through a proxy (RPN/WG). proxyDetails holds the proxy id
+    // (e.g. Backend.RpnWin + configKey); the wildcard match mirrors the filter used
+    // by ConnectionTrackerFragment when navigated from the RPN detail screen.
+    @Query("select * from ConnectionTracker where proxyDetails like '%' || :proxyId || '%' and isBlocked = 0 and appName != '%Unknown%' order by timeStamp desc limit 1")
+    suspend fun getLastRoutedConnectionForProxy(proxyId: String): ConnectionTracker?
+
+    @Query("select * from ConnectionTracker where proxyDetails like '%' || :proxyId || '%' and isBlocked = 0 and appName != '%Unknown%' order by timeStamp desc limit 24")
+    suspend fun getRecentRoutedConnectionsForProxy(proxyId: String): List<ConnectionTracker>
+
+    // Cumulative recent activity across every RPN proxy: [prefix] is matched as a
+    // prefix of proxyDetails (all win-proxy ids share the Backend.RpnWin prefix).
+    // Blocked rows are kept so the feed's status dot can distinguish them.
+    @Query("select * from ConnectionTracker where proxyDetails like :prefix || '%' and appName != '%Unknown%' order by timeStamp desc limit :limit")
+    suspend fun getRecentConnectionsByProxyPrefix(prefix: String, limit: Int): List<ConnectionTracker>
+
+    // Time-windowed aggregates for the network-pulse summary. Counting/summing
+    // over the window (instead of over a capped sample) keeps the numbers real
+    // — a capped sample saturates and stops changing.
+    @Query("select count(*) from ConnectionTracker where proxyDetails like :prefix || '%' and timeStamp > :since")
+    suspend fun countConnectionsByProxyPrefix(prefix: String, since: Long): Int
+
+    @Query("select ifnull(sum(downloadBytes + uploadBytes), 0) from ConnectionTracker where proxyDetails like :prefix || '%' and timeStamp > :since")
+    suspend fun sumBytesByProxyPrefix(prefix: String, since: Long): Long
+
+    @Query("select count(distinct packageName) from ConnectionTracker where proxyDetails like :prefix || '%' and timeStamp > :since")
+    suspend fun countDistinctAppsByProxyPrefix(prefix: String, since: Long): Int
+
+    // Global blocked-connection count over a window; deliberately NOT scoped to
+    // any proxy so the pulse card reflects device-wide blocking.
+    @Query("select count(*) from ConnectionTracker where isBlocked = 1 and timeStamp > :since")
+    suspend fun countBlockedConnectionsSince(since: Long): Int
+
+    @Query(
+        "select sum(downloadBytes) as totalDownload, sum(uploadBytes) as totalUpload, count(id) as connectionsCount, ict.meteredDataUsage as meteredDataUsage from ConnectionTracker as ct join (select sum(downloadBytes + uploadBytes) as meteredDataUsage from ConnectionTracker where connType like :meteredTxt and timeStamp > :to) as ict where timeStamp > :to and proxyDetails = :wgId"
+    )
+    fun getTotalUsagesByWgId(to: Long, meteredTxt: String, wgId: String): DataUsageSummary
+
+    // Aggregate stats for connections routed through an RPN proxy within a time
+    // window. proxyDetails is matched with wildcards (mirrors getLastRoutedConnectionForProxy).
+    @Query(
+        "select count(id) as connectionsCount, coalesce(sum(downloadBytes), 0) as totalDownload, coalesce(sum(uploadBytes), 0) as totalUpload, coalesce(sum(isBlocked), 0) as blockedCount, count(distinct appName) as appCount from ConnectionTracker where proxyDetails like '%' || :proxyId || '%' and timeStamp > :to"
+    )
+    suspend fun getRpnConnStats(proxyId: String, to: Long): RpnConnStatsSummary
+
+    // Top apps (by total bytes) with connections routed through an RPN proxy.
+    @Query(
+        "select uid as uid, '' as ipAddress, 0 as port, count(id) as count, '' as flag, 0 as blocked, appName as appOrDnsName, sum(downloadBytes) as downloadBytes, sum(uploadBytes) as uploadBytes, sum(downloadBytes + uploadBytes) as totalBytes from ConnectionTracker where proxyDetails like '%' || :proxyId || '%' and isBlocked = 0 and timeStamp > :to group by uid, appName order by totalBytes desc limit :limit"
+    )
+    suspend fun getRpnTopAppsForProxy(proxyId: String, to: Long, limit: Int): List<AppConnection>
+
+    // bucketed activity counts for connections routed through RPN proxies only.
+    @Query(
+        "select cast((timeStamp - :rangeStart)/:bucketMs as integer) as bucketIndex, isBlocked as blocked, count(id) as total from ConnectionTracker where timeStamp >= :rangeStart and timeStamp < :rangeEnd and proxyDetails like :proxyIdFilter group by bucketIndex, blocked"
+    )
+    suspend fun getRpnActivityBuckets(
+        proxyIdFilter: String,
+        rangeStart: Long,
+        rangeEnd: Long,
+        bucketMs: Long
+    ): List<ActivityBucketRow>
+
+    @Query(
+        "select coalesce(sum(case when isBlocked then 1 else 0 end), 0) as blocked, count(*) as total from ConnectionTracker where timeStamp >= :start and timeStamp < :end and proxyDetails like :proxyIdFilter"
+    )
+    suspend fun getRpnWindowCounts(proxyIdFilter: String, start: Long, end: Long): WindowCountRow
+
+    @Query(
+        "select uid as uid, appName as appName, count(id) as total, sum(case when isBlocked then 1 else 0 end) as blocked from ConnectionTracker where timeStamp >= :start and timeStamp < :end and proxyDetails like :proxyIdFilter group by uid, appName order by total desc limit :limit"
+    )
+    suspend fun getRpnAppActivity(
+        proxyIdFilter: String,
+        start: Long,
+        end: Long,
+        limit: Int
+    ): List<AppActivityRow>
+
+    @Query(
+        "select * from ConnectionTracker where timeStamp >= :start and timeStamp < :end and uid = :uid and proxyDetails like :proxyIdFilter order by id desc limit :limit"
+    )
+    suspend fun getRpnConnectionsInWindowForUid(
+        proxyIdFilter: String,
+        start: Long,
+        end: Long,
+        uid: Int,
+        limit: Int
+    ): List<ConnectionTracker>
+
+    @Query(
+        "select coalesce(nullif(dnsQuery, ''), ipAddress) as label, count(id) as total, sum(case when isBlocked then 1 else 0 end) as blocked, max(timeStamp) as lastSeen, substr(max(printf('%016d', timeStamp) || flag), 17) as flag from ConnectionTracker where timeStamp >= :start and timeStamp < :end and uid = :uid and proxyDetails like :proxyIdFilter group by label order by total desc limit :limit"
+    )
+    suspend fun getRpnDomainActivityForUid(
+        proxyIdFilter: String,
+        start: Long,
+        end: Long,
+        uid: Int,
+        limit: Int
+    ): List<DomainActivityRow>
+
+    @Query("update ConnectionTracker set message = :reason, duration = 0 where connId in (:connIds) and message = '' and uploadBytes = 0 and downloadBytes = 0 and synack = 0")
+    fun closeConnections(connIds: List<String>, reason: String)
+
+    @Query("update ConnectionTracker set message = :reason, duration = 0 where uid in (:uids) and message = '' and uploadBytes = 0 and downloadBytes = 0 and synack = 0")
+    fun closeConnectionForUids( uids: List<Int>, reason: String)
+
+    @Query(
+        "SELECT uid, MAX(timeStamp) AS lastBlocked, COUNT(*) AS count FROM ConnectionTracker WHERE isBlocked = 1 and timeStamp > :time GROUP BY uid ORDER BY lastBlocked DESC LIMIT 10"
+    )
+    suspend fun getRecentlyBlockedApps(time: Long): List<BlockedAppResult>
+
+    @Query(
+        "SELECT uid, MAX(timeStamp) AS lastBlocked, COUNT(*) AS count FROM ConnectionTracker WHERE isBlocked = 1 and timeStamp > :time GROUP BY uid ORDER BY lastBlocked DESC"
+    )
+    fun getRecentlyBlockedAppsPaged(time: Long): PagingSource<Int, BlockedAppResult>
+
+    @Query(
+        "SELECT * FROM ConnectionTracker WHERE isBlocked = 1 AND timeStamp >= :since ORDER BY timeStamp DESC"
+    )
+    suspend fun getBlockedConnectionsSince(since: Long): List<ConnectionTracker>
+
+    @Query(
+        "SELECT COUNT(*) FROM ConnectionTracker WHERE isBlocked = 1 AND timeStamp >= :since"
+    )
+    fun getBlockedConnectionsCountLiveData(since: Long): LiveData<Int>
+}
+
+data class BlockedAppResult(
+    val uid: Int,
+    val lastBlocked: Long,
+    val count: Int
+)

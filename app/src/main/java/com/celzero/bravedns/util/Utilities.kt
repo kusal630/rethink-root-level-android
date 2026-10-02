@@ -1,0 +1,1147 @@
+/*
+ * Copyright 2020 RethinkDNS and its authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.celzero.bravedns.util
+
+import com.celzero.bravedns.util.Logger.LOG_TAG_APP_DB
+import com.celzero.bravedns.util.Logger.LOG_TAG_DOWNLOAD
+import com.celzero.bravedns.util.Logger.LOG_TAG_FIREWALL
+import com.celzero.bravedns.util.Logger.LOG_TAG_UI
+import com.celzero.bravedns.util.Logger.LOG_TAG_VPN
+import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.AccessibilityServiceInfo
+import android.app.PendingIntent
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageInfo
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.Drawable
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
+import android.os.Build
+import androidx.annotation.ChecksSdkIntAtLeast
+import android.os.Looper
+import android.provider.Settings
+import android.text.TextUtils
+import android.text.TextUtils.SimpleStringSplitter
+import android.util.LruCache
+import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
+import android.view.accessibility.AccessibilityManager
+import android.widget.LinearLayout
+import android.widget.Toast
+import androidx.appcompat.content.res.AppCompatResources
+import androidx.core.content.getSystemService
+import androidx.lifecycle.LifecycleCoroutineScope
+import com.celzero.bravedns.BuildConfig
+import com.celzero.bravedns.R
+import com.celzero.bravedns.RethinkDnsApplication.Companion.DEBUG
+import com.celzero.bravedns.database.AppInfoRepository.Companion.NO_PACKAGE_PREFIX
+import com.celzero.bravedns.net.doh.CountryMap
+import com.celzero.bravedns.service.BraveVPNService
+import com.celzero.bravedns.service.DnsLogTracker
+import com.celzero.bravedns.util.Constants.Companion.BUILD_TYPE_ALPHA
+import com.celzero.bravedns.util.Constants.Companion.FLAVOR_FDROID
+import com.celzero.bravedns.util.Constants.Companion.FLAVOR_PLAY
+import com.celzero.bravedns.util.Constants.Companion.FLAVOR_WEBSITE
+import com.celzero.bravedns.util.Constants.Companion.INVALID_UID
+import com.celzero.bravedns.util.Constants.Companion.LOCAL_BLOCKLIST_DOWNLOAD_FOLDER_NAME
+import com.celzero.bravedns.util.Constants.Companion.MISSING_UID
+import com.celzero.bravedns.util.Constants.Companion.PKG_NAME_PLAY_STORE
+import com.celzero.bravedns.util.Constants.Companion.REMOTE_BLOCKLIST_DOWNLOAD_FOLDER_NAME
+import com.celzero.bravedns.util.Constants.Companion.UNSPECIFIED_IP_IPV4
+import com.celzero.bravedns.util.Constants.Companion.UNSPECIFIED_IP_IPV6
+import com.google.common.net.InternetDomainName
+import com.google.gson.JsonParser
+import inet.ipaddr.HostName
+import inet.ipaddr.IPAddress
+import inet.ipaddr.IPAddressString
+import kotlinx.coroutines.launch
+import okio.HashingSink
+import okio.blackholeSink
+import okio.buffer
+import okio.source
+import java.io.File
+import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
+import java.net.InetAddress
+import java.net.URI
+import java.security.SecureRandom
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.TimeUnit
+import kotlin.math.ln
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.pow
+import kotlin.math.roundToInt
+import kotlin.time.Duration.Companion.milliseconds
+
+@Suppress("TooManyFunctions", "LargeClass")
+object Utilities {
+
+    private const val FLAG_BASE_OFFSET = 0x1F1E6
+    private const val ALPHA_BASE_CODE = 'A'.code
+
+    // stored in DB flag columns when the country code is unknown/invalid;
+    // excluded from country-stat queries by the flag-emoji range filter.
+    // Three dashes so it can't be confused with CountryMap's "--" unknown
+    // marker or UIUtils' "--" country-name fallback.
+    const val UNKNOWN_COUNTRY_FLAG = "---"
+    private const val BUFFER_SIZE = 256
+    private const val HEX_FORMAT = "%02x"
+    private const val BYTE_UNIT_THRESHOLD = 1000
+    private const val BYTE_UNIT_POWER = 1024
+    private const val MINIMUM_OS_VERSION_PARTS = 2
+    private const val DECIMAL_FORMAT_PATTERN = "%.1f %sB"
+
+    private var countryMap: CountryMap? = null
+
+    // convert an FQDN like "www.example.co.uk." to an eTLD + 1 like "example.co.uk".
+    fun getETldPlus1(fqdn: String): String? {
+        return try {
+            val name: InternetDomainName = InternetDomainName.from(fqdn)
+            try {
+                name.topPrivateDomain().toString()
+            } catch (_: IllegalStateException) {
+                // The name doesn't end in a recognized TLD.  This can happen for randomly
+                // generated
+                // names, or when new TLDs are introduced.
+                val parts: List<String> = name.parts()
+                val size = parts.count()
+                if (size >= 2) {
+                    parts[size - 2] + "." + parts[size - 1]
+                } else if (size == 1) {
+                    parts[0]
+                } else {
+                    // Empty input?
+                    fqdn
+                }
+            }
+        } catch (_: IllegalArgumentException) {
+            // If fqdn is not a valid domain name, InternetDomainName.from() will throw an
+            // exception.  Since this function is only for aesthetic purposes, we can
+            // return the input unmodified in this case.
+            // SwallowedException: Intentionally returning input as fallback for aesthetic purposes
+            fqdn
+        }
+    }
+
+    @Suppress("ReturnCount")
+    fun isAccessibilityServiceEnabled(
+        context: Context,
+        service: Class<out AccessibilityService?>
+    ): Boolean {
+        val am = context.getSystemService<AccessibilityManager>() ?: return false
+        val enabledServices =
+            am.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
+        for (enabledService in enabledServices) {
+            val enabledServiceInfo: ServiceInfo = enabledService.resolveInfo.serviceInfo
+            Logger.i(
+                LOG_TAG_VPN,
+                "Accessibility enabled check for: ${enabledServiceInfo.packageName}"
+            )
+            if (
+                enabledServiceInfo.packageName == context.packageName &&
+                    enabledServiceInfo.name == service.name
+            ) {
+                return true
+            }
+        }
+        Logger.w(
+            LOG_TAG_VPN,
+            "Accessibility failure, ${context.packageName},  ${service.name}, return size: ${enabledServices.count()}"
+        )
+        return false
+    }
+
+    @Suppress("ReturnCount")
+    fun isAccessibilityServiceEnabledViaSettingsSecure(
+        context: Context,
+        accessibilityService: Class<out AccessibilityService?>
+    ): Boolean {
+        try {
+            val expectedComponentName = ComponentName(context, accessibilityService)
+            val enabledServicesSetting: String =
+                Settings.Secure.getString(
+                    context.contentResolver,
+                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+                ) ?: return false
+            val colonSplitter = SimpleStringSplitter(':')
+            colonSplitter.setString(enabledServicesSetting)
+            while (colonSplitter.hasNext()) {
+                val componentNameString = colonSplitter.next()
+                val enabledService = ComponentName.unflattenFromString(componentNameString)
+                if (expectedComponentName == enabledService) {
+                    Logger.i(
+                        LOG_TAG_VPN,
+                        "SettingsSecure accessibility enabled for: ${expectedComponentName.packageName}"
+                    )
+                    return true
+                }
+            }
+        } catch (e: Settings.SettingNotFoundException) {
+            Logger.w(
+                LOG_TAG_VPN,
+                "isAccessibilityServiceEnabled err on isAccessibilityServiceEnabledViaSettingsSecure() ${e.message}",
+                e
+            )
+        }
+        Logger.w(LOG_TAG_VPN, "accessibility service not enabled via Settings Secure")
+        return isAccessibilityServiceEnabled(context, accessibilityService)
+    }
+
+    // Return a two-letter ISO country code, or null if that fails.
+    fun getCountryCode(address: InetAddress?, context: Context): String? {
+        initCountryMapIfNeeded(context)
+        return (if (countryMap == null) {
+            null
+        } else {
+            countryMap?.getCountryCode(address)
+        })
+    }
+
+    private fun initCountryMapIfNeeded(context: Context) {
+        if (countryMap != null) {
+            return
+        }
+
+        try {
+            countryMap = CountryMap(context.assets)
+        } catch (e: IOException) {
+            // SwallowedException: Exception is logged, countryMap remains null as fallback
+            Logger.e(LOG_TAG_VPN, "err fetching country map ${e.message}", e)
+        }
+    }
+
+    fun getFlag(countryCode: String?): String {
+        // guard against invalid inputs (e.g. CountryMap's "--" marker for unassigned
+        // IP ranges, or null/short strings). Shifting such characters into the
+        // regional-indicator range produces invalid code points (tofu glyphs), and
+        // inputs shorter than 2 chars would throw StringIndexOutOfBoundsException.
+        if (
+            countryCode == null ||
+            countryCode.length != 2 ||
+            countryCode[0] !in 'A'..'Z' ||
+            countryCode[1] !in 'A'..'Z'
+        ) {
+            return UNKNOWN_COUNTRY_FLAG
+        }
+        // Flag emoji consist of two "regional indicator symbol letters", which are
+        // Unicode characters that correspond to the English alphabet and are arranged in the
+        // same
+        // order.  Therefore, to convert from a country code to a flag, we simply need to apply
+        // an
+        // offset to each character, shifting it from the normal A-Z range into the region
+        // indicator
+        // symbol letter range.
+        val offset = FLAG_BASE_OFFSET - ALPHA_BASE_CODE
+        val firstHalf = countryCode[0].code + offset
+        val secondHalf = countryCode[1].code + offset
+        return String(Character.toChars(firstHalf)) + String(Character.toChars(secondHalf))
+    }
+
+    @Suppress("ReturnCount", "TooGenericExceptionCaught")
+    fun normalizeIp(ipstr: String?): InetAddress? {
+        if (ipstr.isNullOrEmpty()) return null
+
+        try {
+            val ipAddress: IPAddress = HostName(ipstr).asAddress() ?: return null
+            val ip = ipAddress.toInetAddress()
+
+            // no need to check if IP is not of type IPv6
+            if (!IPUtil.isIpV6(ipAddress)) return ip
+
+            val ipv4 = IPUtil.ip4in6(ipAddress)
+
+            return if (ipv4 != null) {
+                ipv4.toInetAddress()
+            } else {
+                ip
+            }
+        } catch (e: Exception) { // not expected
+            Logger.e(LOG_TAG_VPN, "err normalizing ip $ipstr ${e.message}", e)
+        }
+        return null
+    }
+
+    fun makeAddressPair(countryCode: String?, ipAddress: String?): String {
+        return if (ipAddress.isNullOrEmpty()) {
+            "--" // to avoid translation set to "--"
+        } else if (countryCode == null) {
+            ipAddress
+        } else {
+            String.format("%s (%s)", countryCode, ipAddress)
+        }
+    }
+
+    fun convertLongToTime(time: Long, template: String): String {
+        val date = Date(time)
+        return SimpleDateFormat(template, Locale.ENGLISH).format(date)
+    }
+
+    @Suppress("ReturnCount", "TooGenericExceptionCaught")
+    fun isLanIpv4(ipAddress: String): Boolean {
+        try {
+            val ip = IPAddressString(ipAddress).address ?: return false
+
+            return ip.isLoopback || ip.isLocal || ip.isAnyLocal || UNSPECIFIED_IP_IPV4.equals(ip)
+        } catch (e: Exception) {
+            Logger.e(LOG_TAG_VPN, "err in isLanIpv4 ${e.message}", e)
+        }
+        return false
+    }
+
+    fun isValidLocalPort(port: Int?): Boolean {
+        if (port == null) return false
+
+        return isValidPort(port)
+    }
+
+    fun isValidPort(port: Int?): Boolean {
+        if (port == null) return false
+
+        return port in 65535 downTo 0
+    }
+
+    fun isMissingOrInvalidUid(uid: Int): Boolean {
+        return when (uid) {
+            MISSING_UID -> true
+            INVALID_UID -> true
+            else -> false
+        }
+    }
+
+    fun isVpnLockdownEnabled(vpnService: BraveVPNService?): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return false
+        }
+        return vpnService?.isLockdownEnabled == true
+    }
+
+    fun showToastUiCentered(context: Context, message: String, toastLength: Int) {
+        try {
+            val isMainThread = Looper.myLooper() == Looper.getMainLooper()
+            when (context) {
+                is androidx.appcompat.app.AppCompatActivity,
+                is androidx.fragment.app.FragmentActivity,
+                is android.app.Activity -> {
+                    showToastForActivity(context, message, toastLength, isMainThread)
+                }
+                is android.app.Application -> {
+                    showToastForApplication(context, message, toastLength, isMainThread)
+                }
+                else -> {
+                    handleUnsupportedContext(context, message, toastLength, isMainThread)
+                }
+            }
+        } catch (e: IllegalStateException) {
+            Logger.w(LOG_TAG_VPN, "toast err: ${e.message}")
+        } catch (e: IllegalAccessException) {
+            Logger.w(LOG_TAG_VPN, "toast err: ${e.message}")
+        } catch (e: IOException) {
+            Logger.w(LOG_TAG_VPN, "toast err: ${e.message}")
+        } catch (e: Exception) {
+            Logger.w(LOG_TAG_VPN, "toast err: ${e.message}")
+        }
+    }
+
+    private fun showToastForActivity(activity: android.app.Activity, message: String, toastLength: Int, isMainThread: Boolean) {
+        if (isMainThread) {
+            Toast.makeText(activity, message, toastLength).show()
+        } else {
+            activity.runOnUiThread {
+                Toast.makeText(activity, message, toastLength).show()
+            }
+        }
+    }
+
+    private fun showToastForApplication(context: android.app.Application, message: String, toastLength: Int, isMainThread: Boolean) {
+        if (isMainThread) {
+            Toast.makeText(context, message, toastLength).show()
+        } else {
+            android.os.Handler(Looper.getMainLooper()).post {
+                Toast.makeText(context, message, toastLength).show()
+            }
+        }
+    }
+
+    private fun handleUnsupportedContext(context: Context, message: String, toastLength: Int, isMainThread: Boolean) {
+        Logger.w(LOG_TAG_VPN, "toast err: unsuitable context type")
+        if (DEBUG && isMainThread) {
+            Toast.makeText(context, message, toastLength).show()
+        }
+    }
+
+    fun getPackageMetadata(pm: PackageManager, pi: String): PackageInfo? {
+        var metadata: PackageInfo? = null
+        try {
+            metadata =
+                if (isAtleastT()) {
+                    pm.getPackageInfo(
+                        pi,
+                        PackageManager.PackageInfoFlags.of(PackageManager.GET_META_DATA.toLong())
+                    )
+                } else {
+                    pm.getPackageInfo(pi, PackageManager.GET_META_DATA)
+                }
+        } catch (e: PackageManager.NameNotFoundException) {
+            Logger.w(LOG_TAG_APP_DB, "app not available $pi" + e.message, e)
+        }
+        return metadata
+    }
+
+    fun isFreshInstall(ctx: Context): Boolean {
+        try {
+            with(
+                if (isAtleastT()) {
+                    ctx.packageManager.getPackageInfo(
+                        ctx.packageName,
+                        PackageManager.PackageInfoFlags.of(PackageManager.GET_META_DATA.toLong())
+                    )
+                } else {
+                    ctx.packageManager.getPackageInfo(ctx.packageName, PackageManager.GET_META_DATA)
+                }
+            ) {
+                return firstInstallTime == lastUpdateTime
+            }
+        } catch (e: PackageManager.NameNotFoundException) {
+            // assign value as true as the package name not found, should not be the
+            // case but some devices seems to return package not found immediately
+            // after install
+            Logger.w(LOG_TAG_APP_DB, "app not found ${ctx.packageName}" + e.message, e)
+            return true
+        }
+    }
+
+    @Suppress("ReturnCount", "TooGenericExceptionCaught")
+    fun copy(from: String, to: String): Boolean {
+        try {
+            val src = File(from)
+            val dest = File(to)
+
+            if (!src.isFile) return false
+
+            src.copyTo(dest, true)
+        } catch (e: Exception) { // Throws NoSuchFileException, IOException
+            Logger.e(LOG_TAG_DOWNLOAD, "err copying file ${e.message}", e)
+            return false
+        }
+
+        return true
+    }
+
+    fun copyWithStream(readStream: InputStream, writeStream: OutputStream): Boolean {
+        val buffer = ByteArray(BUFFER_SIZE)
+        return try {
+            readStream.use { input ->
+                writeStream.use { output ->
+                    var bytesRead: Int = input.read(buffer, 0, BUFFER_SIZE)
+                    // write the required bytes
+                    while (bytesRead > 0) {
+                        output.write(buffer, 0, bytesRead)
+                        bytesRead = input.read(buffer, 0, BUFFER_SIZE)
+                    }
+                }
+            }
+            true
+        } catch (e: Exception) { // Catches IOException and other stream-related exceptions
+            Logger.w(LOG_TAG_DOWNLOAD, "err while copying files using streams: ${e.message}, $e")
+            false
+        }
+    }
+
+    fun isAlwaysOnEnabled(context: Context, vpnService: BraveVPNService?): Boolean {
+        // Introduced as part of issue fix #325
+        // From android version 12+(R) Settings keys annotated with @hide are restricted to
+        // system_server and system apps only. "always_on_vpn_app" is annotated with @hide.
+
+        // For versions above 29(Q), there is vpnService.isAlwaysOn property to check
+        // whether always-on is enabled.
+        // For versions prior to 29 the check is made with Settings.Secure.
+        // In our case, the always-on check is for all the vpn profiles. So using
+        // vpnService?.isAlwaysOn will not be much helpful
+
+        // Try Settings.Secure first so the check works even when the VPN service is not
+        // bound (e.g. immediately after reboot). On some Android versions this key is
+        // hidden/restricted, so fall back to the service property when available.
+        return try {
+            val alwaysOn = Settings.Secure.getString(context.contentResolver, "always_on_vpn_app")
+            context.packageName == alwaysOn
+        } catch (e: Exception) { // Catches SecurityException and other Settings-related exceptions
+            Logger.w(LOG_TAG_VPN, "err while retrieving Settings.Secure value ${e.message}")
+            if (isAtleastQ()) {
+                vpnService?.isAlwaysOn == true
+            } else {
+                false
+            }
+        }
+    }
+
+    // This function is not supported from version 12 onwards.
+    @Suppress("TooGenericExceptionCaught")
+    fun isOtherVpnHasAlwaysOn(context: Context): Boolean {
+        return try {
+            val alwaysOn = Settings.Secure.getString(context.contentResolver, "always_on_vpn_app")
+            !TextUtils.isEmpty(alwaysOn) && context.packageName != alwaysOn
+        } catch (e: Exception) { // Catches SecurityException and other Settings-related exceptions
+            Logger.w(LOG_TAG_VPN, "err while retrieving Settings.Secure value ${e.message}")
+            false
+        }
+    }
+
+    object AppIconCache {
+        // Icons are stored as pre-scaled bitmaps, not raw drawables.
+        // Launcher icons (AdaptiveIconDrawable layers) are commonly >=432px,
+        // while list views draw them at ~40dp. Downscaling at draw time is a
+        // large bilinear resample on the (software-rasterized) UI thread and
+        // has caused main-thread ANRs while scrolling FastScrollRecyclerViews.
+        // Scaling once here makes every subsequent bind/draw a ~1:1 blit.
+        private const val CACHE_SIZE_BYTES = 16 shl 20 // 16 MiB
+        private const val ICON_SIZE_DP = 48
+
+        private val bitmapCache =
+            object : LruCache<String, Bitmap>(CACHE_SIZE_BYTES) {
+                override fun sizeOf(key: String, value: Bitmap): Int {
+                    return value.allocationByteCount
+                }
+            }
+
+        fun get(
+            context: Context,
+            packageName: String,
+            appName: String? = null
+        ): Drawable? {
+            val sizePx = iconSizePx(context)
+            val key = "${packageName}#${sizePx}"
+            bitmapCache.get(key)?.let {
+                return BitmapDrawable(context.resources, it)
+            }
+
+            if (!isValidAppName(appName, packageName)) {
+                return getDefaultIcon(context)
+            }
+
+            val drawable = try {
+                context.applicationContext.packageManager
+                    .getApplicationIcon(packageName)
+            } catch (_: PackageManager.NameNotFoundException) {
+                return getDefaultIcon(context)
+            }
+
+            val bitmap = downscale(context, drawable, sizePx)
+            // fall back to the original drawable if rasterization failed
+            if (bitmap == null) return drawable
+
+            bitmapCache.put(key, bitmap)
+            return BitmapDrawable(context.resources, bitmap)
+        }
+
+        /**
+         * Rasterizes [drawable] to fit inside a [sizePx] box (never upscales,
+         * never distorts: matches ImageView's fitCenter behaviour so visuals
+         * are identical to drawing the original drawable).
+         */
+        @Suppress("TooGenericExceptionCaught", "ReturnCount")
+        private fun downscale(context: Context, drawable: Drawable, sizePx: Int): Bitmap? {
+            return try {
+                val w = drawable.intrinsicWidth
+                val h = drawable.intrinsicHeight
+                if (w <= 0 || h <= 0) return null
+
+                val scale =
+                    if (w <= sizePx && h <= sizePx) 1f
+                    else min(sizePx.toFloat() / w, sizePx.toFloat() / h)
+                val dw = max(1, (w * scale).roundToInt())
+                val dh = max(1, (h * scale).roundToInt())
+
+                // createBitmap(metrics, ...) stamps the display density so the
+                // resulting BitmapDrawable reports dp-sized intrinsic bounds.
+                val bitmap =
+                    Bitmap.createBitmap(
+                        context.resources.displayMetrics,
+                        dw,
+                        dh,
+                        Bitmap.Config.ARGB_8888
+                    )
+                val canvas = Canvas(bitmap)
+                // mutate() so bounds changes never leak into a shared ConstantState
+                drawable.mutate().setBounds(0, 0, dw, dh)
+                drawable.draw(canvas)
+                bitmap
+            } catch (e: Exception) {
+                Logger.w(LOG_TAG_UI, "err downscaling icon: ${e.message}")
+                null
+            }
+        }
+
+        private fun iconSizePx(context: Context): Int {
+            val density = context.resources.displayMetrics.density
+            return max(1, (ICON_SIZE_DP * density).toInt())
+        }
+    }
+
+    // Backward-compatible wrapper that delegates to AppIconCache.
+    fun getIcon(
+        ctx: Context,
+        packageName: String,
+        appName: String? = null
+    ): Drawable? {
+        return AppIconCache.get(ctx, packageName, appName)
+    }
+
+    private fun isValidAppName(appName: String?, packageName: String): Boolean {
+        return !isNonApp(packageName) && Constants.UNKNOWN_APP != appName
+    }
+
+    private var defaultIconState: Drawable.ConstantState? = null
+
+    fun getDefaultIcon(context: Context): Drawable? {
+        defaultIconState?.let {
+            return it.newDrawable(context.resources)
+        }
+
+        val drawable = AppCompatResources.getDrawable(
+            context,
+            R.drawable.default_app_icon
+        )
+
+        defaultIconState = drawable?.constantState
+
+        return drawable
+    }
+
+    @Suppress("TooGenericExceptionCaught")
+    fun delay(ms: Long, scope: LifecycleCoroutineScope, updateUi: () -> Unit) {
+        scope.launch {
+            kotlinx.coroutines.delay(ms.milliseconds)
+            try {
+                updateUi()
+            } catch (e: Exception) { // Catches any exception from user-provided updateUi lambda
+                Logger.e(LOG_TAG_VPN, "err in delay fn ${e.message}", e)
+            }
+        }
+    }
+
+    fun getPackageInfoForUid(ctx: Context, uid: Int): Array<out String>? {
+        try {
+            return ctx.packageManager.getPackagesForUid(uid)
+        } catch (e: PackageManager.NameNotFoundException) {
+            Logger.w(LOG_TAG_FIREWALL, "package not found for uid: $uid, err: ${e.message}")
+        } catch (e: SecurityException) {
+            Logger.w(LOG_TAG_FIREWALL, "package not found for uid: $uid, err: ${e.message}")
+        } catch (e: Exception) {
+            Logger.w(LOG_TAG_FIREWALL, "err fetching packages for uid: $uid, err: ${e.message}")
+        }
+        return null
+    }
+
+    // annotated so lint's NewApi check treats calls guarded by this helper
+    // as safe (minSdk 23 < TileService's API 24 requirement)
+    @ChecksSdkIntAtLeast(api = Build.VERSION_CODES.N)
+    fun isAtleastN(): Boolean {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.N
+    }
+
+    fun isAtleastO(): Boolean {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+    }
+
+    fun isAtleastO_MR1(): Boolean {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1
+    }
+
+    fun isAtleastP(): Boolean {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+    }
+
+    fun isAtleastQ(): Boolean {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+    }
+
+    fun isAtleastR(): Boolean {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+    }
+
+    fun isAtleastS(): Boolean {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+    }
+
+    fun isAtleastT(): Boolean {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+    }
+
+    fun isAtleastU(): Boolean {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE
+    }
+
+    fun isAtleastV(): Boolean {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM
+    }
+
+    fun isAtleast36(): Boolean {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.BAKLAVA
+    }
+
+    fun isAtleast37(): Boolean {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.CINNAMON_BUN
+    }
+
+    fun isFdroidFlavour(): Boolean {
+        return BuildConfig.FLAVOR_releaseChannel == FLAVOR_FDROID
+    }
+
+    fun isWebsiteFlavour(): Boolean {
+        return BuildConfig.FLAVOR_releaseChannel == FLAVOR_WEBSITE
+    }
+
+    fun isPlayStoreFlavour(): Boolean {
+        return BuildConfig.FLAVOR_releaseChannel == FLAVOR_PLAY
+    }
+
+    fun isWebsiteDegoogledFlavour(): Boolean {
+        return isFdroidFlavour() && BuildConfig.IS_WEBSITE_DEGOOGLD_BUILD
+    }
+
+    /**
+     * Whether Google Play billing can be used on this device for this build.
+     *
+     * Returns `true` only when:
+     *  - the running flavor ships the Play Billing implementation (play or website), and
+     *  - the Play Store (Google Play Services) package is installed and enabled.
+     *
+     * The fdroid flavor has no billing client and always returns `false`. On devices without
+     * Google Play Services (e.g. degoogled phones running the play/website build), the sponsor
+     * UI uses this to fall back to the Stripe web option only.
+     */
+    fun isGooglePlayServicesAvailable(context: Context): Boolean {
+        if (!isPlayStoreFlavour() && !isWebsiteFlavour()) return false
+        return getApplicationInfo(context, PKG_NAME_PLAY_STORE)?.enabled == true
+    }
+
+
+    /** Returns true when the app is built with the "alpha" build type. */
+    fun isAlphaBuild(): Boolean {
+        return BuildConfig.BUILD_TYPE == BUILD_TYPE_ALPHA
+    }
+
+    @Suppress("TooGenericExceptionCaught")
+    fun getApplicationInfo(ctx: Context, packageName: String): ApplicationInfo? {
+        return try {
+            if (isAtleastT()) {
+                ctx.packageManager.getApplicationInfo(
+                    packageName,
+                    PackageManager.ApplicationInfoFlags.of(PackageManager.GET_META_DATA.toLong())
+                )
+            } else {
+                ctx.packageManager.getApplicationInfo(packageName, PackageManager.GET_META_DATA)
+            }
+        } catch (e: PackageManager.NameNotFoundException) {
+            Logger.w(LOG_TAG_FIREWALL, "no app info for package name: $packageName, err: ${e.message}")
+            null
+        } catch (e: Exception) {
+            Logger.w(LOG_TAG_FIREWALL, "err fetching app info for package: $packageName, err: ${e.message}")
+            null
+        }
+    }
+
+    fun isUnspecifiedIp(serverIp: String): Boolean {
+        return UNSPECIFIED_IP_IPV4 == serverIp || UNSPECIFIED_IP_IPV6 == serverIp
+    }
+
+    fun deleteRecursive(fileOrDirectory: File): Boolean {
+        try {
+            if (fileOrDirectory.isDirectory) {
+                fileOrDirectory.listFiles()?.forEach { child -> deleteRecursive(child) }
+            }
+            val isDeleted: Boolean =
+                if (isAtleastO()) {
+                    fileOrDirectory.deleteRecursively()
+                } else {
+                    fileOrDirectory.delete()
+                }
+            Logger.d(LOG_TAG_DOWNLOAD, "deleteRecursive File : ${fileOrDirectory.path}, $isDeleted")
+            return isDeleted
+        } catch (e: Exception) { // Catches SecurityException, IOException, etc.
+            Logger.w(LOG_TAG_DOWNLOAD, "err on file delete: ${e.message}", e)
+        }
+        return false
+    }
+
+    fun localBlocklistFileDownloadPath(ctx: Context, which: String, timestamp: Long): String {
+        return blocklistDownloadBasePath(ctx, LOCAL_BLOCKLIST_DOWNLOAD_FOLDER_NAME, timestamp) +
+            File.separator +
+            which
+    }
+
+    fun oldLocalBlocklistDownloadDir(ctx: Context, timestamp: Long): String {
+        return ctx.filesDir.canonicalPath + File.separator + timestamp + File.separator
+    }
+
+    fun hasLocalBlocklists(ctx: Context, timestamp: Long): Boolean {
+        val a =
+            Constants.ONDEVICE_BLOCKLISTS_ADM.all {
+                localBlocklistFile(ctx, it.filename, timestamp)?.exists() == true
+            }
+        return a
+    }
+
+    fun tempDownloadBasePath(ctx: Context, which: String, timestamp: Long): String {
+        // instead of creating folder for actual timestamp, create for its negative value
+        return blocklistCanonicalPath(ctx, which) + File.separator + (-1 * timestamp)
+    }
+
+    fun blocklistDownloadBasePath(ctx: Context, which: String, timestamp: Long): String {
+        return blocklistCanonicalPath(ctx, which) + File.separator + timestamp
+    }
+
+    fun blocklistCanonicalPath(ctx: Context, which: String): String {
+        return ctx.filesDir.canonicalPath + File.separator + which
+    }
+
+    private fun localBlocklistFile(ctx: Context, which: String, timestamp: Long): File? {
+        return try {
+            val localBlocklist = localBlocklistFileDownloadPath(ctx, which, timestamp)
+
+            return File(localBlocklist)
+        } catch (e: IOException) {
+            Logger.e(LOG_TAG_VPN, "err fetching local blocklist: " + e.message, e)
+            null
+        }
+    }
+
+    @Suppress("ReturnCount")
+    fun hasRemoteBlocklists(ctx: Context, timestamp: Long): Boolean {
+        val remoteDir =
+            blocklistDir(ctx, REMOTE_BLOCKLIST_DOWNLOAD_FOLDER_NAME, timestamp) ?: return false
+        val remoteFile =
+            blocklistFile(remoteDir.absolutePath, Constants.ONDEVICE_BLOCKLIST_FILE_TAG)
+                ?: return false
+        return remoteFile.exists()
+    }
+
+    fun blocklistDir(ctx: Context?, which: String, timestamp: Long): File? {
+        if (ctx == null) {
+            Logger.v(LOG_TAG_UI, "Context is null, returning null")
+            return null
+        }
+        return try {
+            File(blocklistDownloadBasePath(ctx, which, timestamp))
+        } catch (e: IOException) {
+            Logger.e(LOG_TAG_VPN, "Could not fetch remote blocklist: " + e.message, e)
+            null
+        }
+    }
+
+    fun blocklistFile(dirPath: String, fileName: String): File? {
+        return try {
+            return File(dirPath + fileName)
+        } catch (e: IOException) {
+            Logger.e(LOG_TAG_VPN, "Could not fetch remote blocklist: " + e.message, e)
+            null
+        }
+    }
+
+    fun isNonApp(p: String): Boolean {
+        return p.startsWith(NO_PACKAGE_PREFIX)
+    }
+
+    fun removeLeadingAndTrailingDots(str: String?): String {
+        if (str.isNullOrBlank()) return ""
+
+        // remove leading and trailing dots(.) from the given string
+        // eg., (....adsd.asd.asa... will result in .adsd.asd.asa)
+        val trimmedTrailing = str.trimEnd('.')
+        val leadingDotMatch = Regex("^\\.*(?=\\w)").find(trimmedTrailing)
+
+        return when {
+            leadingDotMatch != null && leadingDotMatch.value.length > 1 -> {
+                // more than one leading dot, reduce to a single dot
+                "." + trimmedTrailing.drop(leadingDotMatch.value.length)
+            }
+
+            else -> trimmedTrailing
+        }
+    }
+
+    // https://medium.com/androiddevelopers/all-about-pendingintents-748c8eb8619
+    fun getActivityPendingIntent(
+        context: Context,
+        intent: Intent,
+        flag: Int,
+        mutable: Boolean
+    ): PendingIntent {
+        return if (isAtleastS()) {
+            val sFlag = flag or if (mutable) PendingIntent.FLAG_MUTABLE else PendingIntent.FLAG_IMMUTABLE
+            PendingIntent.getActivity(context, 0, intent, sFlag)
+        } else {
+            val sFlag = flag or PendingIntent.FLAG_IMMUTABLE
+            PendingIntent.getActivity(context, 0, intent, sFlag)
+        }
+    }
+
+    fun getBroadcastPendingIntent(
+        context: Context,
+        requestCode: Int,
+        intent: Intent,
+        flag: Int,
+        mutable: Boolean
+    ): PendingIntent {
+        return if (isAtleastS()) {
+            val sFlag = flag or if (mutable) PendingIntent.FLAG_MUTABLE else PendingIntent.FLAG_IMMUTABLE
+            PendingIntent.getBroadcast(context, requestCode, intent, sFlag)
+        } else {
+            val sFlag = flag or PendingIntent.FLAG_IMMUTABLE
+            PendingIntent.getBroadcast(context, requestCode, intent, sFlag)
+        }
+    }
+
+    fun getRemoteBlocklistStamp(url: String): String {
+        return try {
+            if (url.isBlank()) return ""
+            // extract the path from the url string
+            // eg., https://dns.google/dns-query will result in /dns-query
+            val path = URI(url).path ?: return ""
+            // remove the trailing and leading slashes from the path
+            // eg., /dns-query will result in dns-query
+            // earlier check of : will not work as now remote stamp can contain sec/rec
+            val stamp = path.trim('/').trim()
+            // don't conflate a non-blocklist DoH path (e.g. /dns-query) with an
+            // empty stamp; only base rethinkdns endpoints carry the stamp as path
+            Logger.d(Logger.LOG_TAG_DNS, "getRemoteBlocklistStamp: url=$url, stamp=$stamp")
+            stamp
+        } catch (e: Exception) {
+            Logger.w(Logger.LOG_TAG_DNS, "failure fetching stamp from Go ${e.message}", e)
+            ""
+        }
+    }
+
+    enum class PrivateDnsMode {
+        NONE, // The setting is "Off" or "Opportunistic", and the DNS connection is not using
+        // TLS.
+        UPGRADED, // The setting is "Opportunistic", and the DNS connection has upgraded to TLS.
+        STRICT // The setting is "Strict".
+    }
+
+    @Suppress("ReturnCount")
+    fun getPrivateDnsMode(context: Context): PrivateDnsMode {
+        // https://github.com/celzero/rethink-app/issues/408
+        if (!isAtleastQ()) {
+            // Private DNS was introduced in P.
+            return PrivateDnsMode.NONE
+        }
+
+        val linkProperties: LinkProperties =
+            getLinkProperties(context) ?: return PrivateDnsMode.NONE
+        if (linkProperties.privateDnsServerName != null) {
+            return PrivateDnsMode.STRICT
+        }
+        return if (linkProperties.isPrivateDnsActive) {
+            PrivateDnsMode.UPGRADED
+        } else {
+            PrivateDnsMode.NONE
+        }
+    }
+
+    fun isPrivateDnsActive(context: Context): Boolean {
+        return getPrivateDnsMode(context) != PrivateDnsMode.NONE
+    }
+
+    private fun getLinkProperties(context: Context): LinkProperties? {
+        val connectivityManager =
+            context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val activeNetwork = connectivityManager.activeNetwork ?: return null
+        return connectivityManager.getLinkProperties(activeNetwork)
+    }
+
+    fun removeBeginningTrailingCommas(value: String): String {
+        return value.removePrefix(",").dropLastWhile { it == ',' }
+    }
+
+    fun getDnsPort(port: Int): Int {
+        if (port > 65535 || port <= 0) return 53
+        return port
+    }
+
+    // generates a user-specified number of random bytes, converts it to hexadecimal, and then
+    // provides the hexadecimal value as a string
+    fun getRandomString(length: Int): String {
+        val secureRandom = SecureRandom()
+        val random = ByteArray(length)
+        secureRandom.nextBytes(random)
+        // formats each byte as a two-character hexadecimal string
+        return random.joinToString("") { HEX_FORMAT.format(it) }
+    }
+
+    @Suppress("ReturnCount", "TooGenericExceptionCaught")
+    fun humanReadableByteCount(bytes: Long, si: Boolean): String {
+        val unit = if (si) BYTE_UNIT_THRESHOLD else BYTE_UNIT_POWER
+        if (bytes < unit) return "$bytes B"
+        try {
+            val exp = (ln(bytes.toDouble()) / ln(unit.toDouble())).toInt()
+            val pre = ("KMGTPE")[exp - 1] + if (si) "" else "i"
+            val totalBytes = bytes / unit.toDouble().pow(exp.toDouble())
+            return String.format(Locale.ROOT, DECIMAL_FORMAT_PATTERN, totalBytes, pre)
+        } catch (e: NumberFormatException) {
+            Logger.e(LOG_TAG_DOWNLOAD, "err in humanReadableByteCount: ${e.message}", e)
+        } catch (e: Exception) {
+            Logger.e(LOG_TAG_DOWNLOAD, "err in humanReadableByteCount: ${e.message}", e)
+        }
+        return ""
+    }
+
+    fun calculateMd5(filePath: String): String {
+        // HashingSink will update the md5sum with every write call and then call down
+        // to blackholeSink(), ref: https://stackoverflow.com/a/61217039
+        return File(filePath).source().buffer().use { source ->
+            HashingSink.md5(blackholeSink()).use { sink ->
+                source.readAll(sink)
+                sink.hash.hex()
+            }
+        }
+    }
+
+    fun getTagValueFromJson(path: String, tag: String): String {
+        var tagValue = ""
+        try {
+            // Read the JSON file
+            val jsonContent = File(path).readText()
+
+            // Parse JSON using JsonParser
+            val jsonObject = JsonParser.parseString(jsonContent).asJsonObject
+
+            // Extract the specific tag value
+            if (jsonObject.has(tag)) {
+                tagValue = jsonObject.get(tag).asString
+                Logger.i(LOG_TAG_DOWNLOAD, "get tag value: $tagValue, for tag: $tag")
+            } else {
+                Logger.i(LOG_TAG_DOWNLOAD, "tag not found: $tag")
+            }
+        } catch (e: Exception) {
+            Logger.e(LOG_TAG_DOWNLOAD, "err parsing the json file: ${e.message}", e)
+        }
+        return tagValue
+    }
+
+    fun isNetworkSame(n1: Network?, n2: Network?): Boolean {
+        if (n1 == null || n2 == null) return n1 == n2
+
+        return n1.networkHandle == n2.networkHandle
+    }
+
+    // used to check if the current os version is above 4.12 for anti-censorship feature
+    // desync requires os version above 4.12
+    @Suppress("ReturnCount")
+    fun isOsVersionAbove412(targetVersion: String): Boolean {
+        // get the os version from system properties
+        val osVersion = System.getProperty("os.version") ?: return false
+
+        val f: java.nio.file.Files? = null
+        // extract the version part without any additional details after a '-'
+        val currentVersion =
+            osVersion.split("-").firstOrNull() ?: return false // use only the part before '-' if present
+
+        val version1Parts = currentVersion.split(".").mapNotNull { it.toIntOrNull() }
+        val version2Parts = targetVersion.split(".").mapNotNull { it.toIntOrNull() }
+
+        // Ensure both versions have minimum required parts
+        if (version1Parts.size < MINIMUM_OS_VERSION_PARTS || version2Parts.size < MINIMUM_OS_VERSION_PARTS) {
+            return false
+        }
+
+        // find the maximum length to compare up to the longest version component
+        val maxLength = maxOf(version1Parts.size, version2Parts.size)
+
+        for (i in 0 until maxLength) {
+            // convert each part to an integer for numerical comparison, default to 0 if null
+            val part1 = version1Parts.getOrNull(i) ?: 0
+            val part2 = version2Parts.getOrNull(i) ?: 0
+
+            // if parts differ, return comparison result
+            if (part1 != part2) {
+                return part1 >= part2
+            }
+        }
+
+        return true // versions are equal
+    }
+
+    fun writeToFile(file: File, content: ByteArray): Boolean {
+        return try {
+            file.outputStream().use { output ->
+                output.write(content)
+                output.flush()
+            }
+            true
+        } catch (e: IOException) {
+            Logger.e(LOG_TAG_VPN, "err writing to file ${file.path}, ${e.message}", e)
+            false
+        }
+    }
+
+    fun getIpForUrl(context: Context, url: String): String? {
+        val urls = context.resources.getStringArray(R.array.urls)
+        val ips = context.resources.getStringArray(R.array.ips)
+        val index = urls.indexOf(url)
+        if (index != -1 && index < ips.size) {
+            return ips[index].split(",").firstOrNull()?.trim()
+        }
+        return null
+    }
+
+    /**
+     * Keeps the buttons of [buttonContainer] on a single horizontal row while they
+     * fit, and stacks them vertically once they no longer do (small screens, long
+     * localized labels, foldables in the folded state). This prevents buttons from
+     * overlapping or clipping in wrap_content-width dialogs.
+     *
+     * Must be called after the container's content (text, visibility) is set; the
+     * check runs on the next layout pass via [View.post].
+     */
+    fun adjustButtonLayoutOrientation(buttonContainer: LinearLayout) {
+        buttonContainer.post {
+            var totalButtonsWidth = 0
+            for (index in 0 until buttonContainer.childCount) {
+                val child = buttonContainer.getChildAt(index)
+                if (child.visibility == View.GONE) continue
+                val margins =
+                    (child.layoutParams as? ViewGroup.MarginLayoutParams)?.let {
+                        it.marginStart + it.marginEnd
+                    } ?: 0
+                totalButtonsWidth += child.measuredWidth + margins
+            }
+            // container.width includes its own horizontal padding
+            if (totalButtonsWidth > buttonContainer.width) {
+                // No space for a single row: order the buttons vertically.
+                buttonContainer.orientation = LinearLayout.VERTICAL
+                buttonContainer.gravity = Gravity.CENTER_HORIZONTAL
+            } else {
+                buttonContainer.orientation = LinearLayout.HORIZONTAL
+                buttonContainer.gravity = Gravity.END
+            }
+        }
+    }
+
+}

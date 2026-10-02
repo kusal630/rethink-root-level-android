@@ -1,0 +1,248 @@
+/*
+ * Copyright 2022 RethinkDNS and its authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.celzero.bravedns.viewmodel
+
+import androidx.lifecycle.LiveData
+import androidx.lifecycle.MutableLiveData
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.liveData
+import androidx.lifecycle.switchMap
+import androidx.lifecycle.viewModelScope
+import androidx.paging.Pager
+import androidx.paging.PagingConfig
+import androidx.paging.PagingData
+import androidx.paging.cachedIn
+import androidx.paging.liveData
+import com.celzero.bravedns.data.AppConnection
+import com.celzero.bravedns.data.BlocklistStatsAggregator
+import com.celzero.bravedns.database.ConnectionTrackerDAO
+import com.celzero.bravedns.database.StatsSummaryDao
+import com.celzero.bravedns.service.VpnController
+import com.celzero.bravedns.ui.fragment.SummaryStatisticsFragment
+import com.celzero.bravedns.util.Constants
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
+class DetailedStatisticsViewModel(
+    private val connectionTrackerDAO: ConnectionTrackerDAO,
+    private val statsDao: StatsSummaryDao
+) : ViewModel() {
+    private val allActiveConns: MutableLiveData<Long> = MutableLiveData()
+    private val allowedNetworkActivity: MutableLiveData<String> = MutableLiveData()
+    private val blockedNetworkActivity: MutableLiveData<String> = MutableLiveData()
+    private val allowedAsn: MutableLiveData<String> = MutableLiveData()
+    private val blockedAsn: MutableLiveData<String> = MutableLiveData()
+    private val allowedDomains: MutableLiveData<String> = MutableLiveData()
+    private val blockedDomains: MutableLiveData<String> = MutableLiveData()
+    private val allowedIps: MutableLiveData<String> = MutableLiveData()
+    private val blockedIps: MutableLiveData<String> = MutableLiveData()
+    private val allowedCountries: MutableLiveData<String> = MutableLiveData()
+    private val blockedBlocklists: MutableLiveData<String> = MutableLiveData()
+    private val startTime: MutableLiveData<Long> = MutableLiveData()
+
+    // when set, the blocklists drill-down is scoped to this uid; INVALID_UID
+    // (the default, used by the stats screen) keeps it device-wide
+    private var uid: Int = Constants.INVALID_UID
+
+    fun setUid(uid: Int) {
+        this.uid = uid
+    }
+
+    companion object {
+        private const val ONE_HOUR_MILLIS = 1 * 60 * 60 * 1000L
+        private const val ONE_DAY_MILLIS = 24 * ONE_HOUR_MILLIS
+        private const val ONE_WEEK_MILLIS = 7 * ONE_DAY_MILLIS
+    }
+
+    fun setData(type: SummaryStatisticsFragment.SummaryStatisticsType) {
+        when (type) {
+            SummaryStatisticsFragment.SummaryStatisticsType.TOP_ACTIVE_CONNS -> {
+                allActiveConns.value = VpnController.uptimeMs()
+            }
+            SummaryStatisticsFragment.SummaryStatisticsType.MOST_CONNECTED_APPS -> {
+                allowedNetworkActivity.value = ""
+            }
+            SummaryStatisticsFragment.SummaryStatisticsType.MOST_BLOCKED_APPS -> {
+                blockedNetworkActivity.value = ""
+            }
+            SummaryStatisticsFragment.SummaryStatisticsType.MOST_CONNECTED_ASN -> {
+                allowedAsn.value = ""
+            }
+            SummaryStatisticsFragment.SummaryStatisticsType.MOST_BLOCKED_ASN -> {
+                blockedAsn.value = ""
+            }
+            SummaryStatisticsFragment.SummaryStatisticsType.MOST_CONTACTED_DOMAINS -> {
+                allowedDomains.value = ""
+            }
+            SummaryStatisticsFragment.SummaryStatisticsType.MOST_BLOCKED_DOMAINS -> {
+                blockedDomains.value = ""
+            }
+            SummaryStatisticsFragment.SummaryStatisticsType.MOST_CONTACTED_IPS -> {
+                allowedIps.value = ""
+            }
+            SummaryStatisticsFragment.SummaryStatisticsType.MOST_BLOCKED_IPS -> {
+                blockedIps.value = ""
+            }
+            SummaryStatisticsFragment.SummaryStatisticsType.MOST_CONTACTED_COUNTRIES -> {
+                allowedCountries.value = ""
+            }
+            SummaryStatisticsFragment.SummaryStatisticsType.MOST_BLOCKED_BLOCKLISTS -> {
+                blockedBlocklists.value = ""
+            }
+        }
+    }
+
+    fun timeCategoryChanged(timeCategory: SummaryStatisticsViewModel.TimeCategory) {
+        when (timeCategory) {
+            SummaryStatisticsViewModel.TimeCategory.ONE_HOUR -> {
+                startTime.value = System.currentTimeMillis() - ONE_HOUR_MILLIS
+            }
+            SummaryStatisticsViewModel.TimeCategory.TWENTY_FOUR_HOUR -> {
+                startTime.value = System.currentTimeMillis() - ONE_DAY_MILLIS
+            }
+            SummaryStatisticsViewModel.TimeCategory.SEVEN_DAYS -> {
+                startTime.value = System.currentTimeMillis() - ONE_WEEK_MILLIS
+            }
+        }
+    }
+
+    val getAllActiveConns =
+        allActiveConns.switchMap {
+            val to = System.currentTimeMillis() - it
+            Pager(PagingConfig(Constants.LIVEDATA_PAGE_SIZE)) {
+                    statsDao.getAllActiveConns(to)
+                }
+                .liveData
+                .cachedIn(viewModelScope)
+        }
+
+    val getAllAllowedAppNetworkActivity =
+        allowedNetworkActivity.switchMap { _ ->
+            Pager(PagingConfig(Constants.LIVEDATA_PAGE_SIZE)) {
+                    val to = startTime.value ?: 0L
+                    statsDao.getAllAllowedApps(to)
+                }
+                .liveData
+                .cachedIn(viewModelScope)
+        }
+
+    val getAllAllowedAsn =
+        allowedAsn.switchMap { _ ->
+            Pager(PagingConfig(Constants.LIVEDATA_PAGE_SIZE)) {
+                    val to = startTime.value ?: 0L
+                    statsDao.getAllConnectedASN(to)
+                }
+                .liveData
+                .cachedIn(viewModelScope)
+        }
+
+    val getAllBlockedAsn =
+        blockedAsn.switchMap { _ ->
+            Pager(PagingConfig(Constants.LIVEDATA_PAGE_SIZE)) {
+                    val to = startTime.value ?: 0L
+                    statsDao.getAllBlockedASN(to)
+                }
+                .liveData
+                .cachedIn(viewModelScope)
+        }
+
+    val getAllBlockedAppNetworkActivity =
+        blockedNetworkActivity.switchMap { _ ->
+            Pager(PagingConfig(Constants.LIVEDATA_PAGE_SIZE)) {
+                    val to = startTime.value ?: 0L
+                    statsDao.getAllBlockedApps(to)
+                }
+                .liveData
+                .cachedIn(viewModelScope)
+        }
+
+    val getAllBlockedDomains = blockedDomains.switchMap {
+        Pager(PagingConfig(Constants.LIVEDATA_PAGE_SIZE)) {
+            val to = startTime.value ?: 0L
+            // per-app screen scopes blocked domains to that uid; the stats
+            // screen keeps the device-wide list
+            if (uid == Constants.INVALID_UID) {
+                statsDao.getAllBlockedDomains(to)
+            } else {
+                statsDao.getAllBlockedDomainsByUid(uid, to)
+            }
+        }.liveData.cachedIn(viewModelScope)
+    }
+
+    val getAllContactedDomains = allowedDomains.switchMap {
+        Pager(PagingConfig(Constants.LIVEDATA_PAGE_SIZE)) {
+            val to = startTime.value ?: 0L
+            statsDao.getAllContactedDomains(to)
+        }.liveData.cachedIn(viewModelScope)
+    }
+
+    val getAllContactedIps =
+        allowedIps.switchMap { _ ->
+            Pager(PagingConfig(Constants.LIVEDATA_PAGE_SIZE)) {
+                    val to = startTime.value ?: 0L
+                    connectionTrackerDAO.getAllContactedIps(to)
+                }
+                .liveData
+                .cachedIn(viewModelScope)
+        }
+
+    val getAllBlockedIps =
+        blockedIps.switchMap { _ ->
+            Pager(PagingConfig(Constants.LIVEDATA_PAGE_SIZE)) {
+                    val to = startTime.value ?: 0L
+                    connectionTrackerDAO.getAllBlockedIps(to)
+                }
+                .liveData
+                .cachedIn(viewModelScope)
+        }
+
+    val getAllContactedCountries =
+        allowedCountries.switchMap { _ ->
+            Pager(PagingConfig(Constants.LIVEDATA_PAGE_SIZE)) {
+                    val to = startTime.value ?: 0L
+                    statsDao.getAllContactedCountries(to)
+                }
+                .liveData
+                .cachedIn(viewModelScope)
+        }
+
+    /**
+     * All blocklists with blocked-query totals for the current time window,
+     * scoped to [uid] when set (per-app screen) or device-wide otherwise.
+     * Aggregation happens in [BlocklistStatsAggregator]; no tag filtering is
+     * applied here — list-tag filter chips live only in the blocklist
+     * drill-down ([com.celzero.bravedns.ui.activity.DomainConnectionsActivity]).
+     */
+    val getAllBlockedBlocklists: LiveData<PagingData<AppConnection>> =
+        blockedBlocklists.switchMap { _ ->
+            liveData {
+                val to = startTime.value ?: 0L
+                val items = withContext(Dispatchers.IO) {
+                    // DnsLogs only; ConnectionTracker echoes would double-count
+                    val combos =
+                        if (uid == Constants.INVALID_UID) {
+                            statsDao.getBlockedBlocklistCombos(to)
+                        } else {
+                            statsDao.getBlockedBlocklistCombosByUid(uid, to)
+                        }
+                    BlocklistStatsAggregator.toAppConnections(
+                        BlocklistStatsAggregator.aggregate(combos, emptySet())
+                    )
+                }
+                emit(PagingData.from(items))
+            }
+        }
+}

@@ -1,0 +1,1319 @@
+/*
+ * Copyright 2020 RethinkDNS and its authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.celzero.bravedns.service
+
+import com.celzero.bravedns.util.Logger
+import com.celzero.bravedns.util.Logger.LOG_TAG_FIREWALL
+import android.app.KeyguardManager
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageInfo
+import android.content.pm.PackageManager
+import androidx.lifecycle.MutableLiveData
+import com.celzero.bravedns.R
+import com.celzero.bravedns.database.AppInfo
+import com.celzero.bravedns.database.AppInfoRepository
+import com.celzero.bravedns.service.FirewallManager.GlobalVariable.appInfos
+import com.celzero.bravedns.service.FirewallManager.GlobalVariable.appInfosLiveData
+import com.celzero.bravedns.service.FirewallManager.GlobalVariable.foregroundUids
+import com.celzero.bravedns.util.AndroidUidConfig
+import com.celzero.bravedns.util.Constants.Companion.RETHINK_PACKAGE
+import com.celzero.bravedns.util.OrbotHelper
+import com.google.common.cache.Cache
+import com.google.common.cache.CacheBuilder
+import com.google.common.cache.RemovalCause
+import com.google.common.cache.RemovalListener
+import com.google.common.collect.HashMultimap
+import com.google.common.collect.Multimap
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import org.koin.core.component.KoinComponent
+import org.koin.core.component.inject
+import java.time.Duration
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executor
+import java.util.concurrent.Executors
+
+object FirewallManager : KoinComponent {
+
+    private val db by inject<AppInfoRepository>()
+    private val persistentState by inject<PersistentState>()
+
+    private val mutex = Mutex()
+    private data class AppUpdateLock(val mutex: Mutex = Mutex(), var refCount: Int = 0)
+    private val appUpdateLocks = ConcurrentHashMap<Int, AppUpdateLock>()
+
+    const val NOTIF_CHANNEL_ID_FIREWALL_ALERTS = "Firewall_Alerts"
+
+    // max time to keep the tombstone entry in the database
+    const val TOMBSTONE_EXPIRY_TIME_MS = 7 * 24 * 60 * 60 * 1000L // 7 days
+
+    const val TEMP_ALLOW_DEFAULT_MINUTES = 15 // 15 minutes
+
+    // androidxref.com/9.0.0_r3/xref/frameworks/base/core/java/android/os/UserHandle.java
+    private const val PER_USER_RANGE = 100000
+
+    // lo part is the uid within the user and hi part is the userId
+    // androidxref.com/9.0.0_r3/xref/frameworks/base/core/java/android/os/UserHandle.java#224
+    fun appId(uid: Int, mainUserOnly: Boolean = false): Int {
+        if (mainUserOnly) return uid % PER_USER_RANGE
+
+        return uid
+    }
+
+    // hi part is the userId and lo part is the uid within the user
+    // androidxref.com/9.0.0_r3/xref/frameworks/base/core/java/android/os/UserHandle.java#183
+    fun userId(uid: Int): Int {
+        return uid / PER_USER_RANGE
+    }
+
+    // Below are the firewall rule set
+    // app-status | connection-status |  Rule
+    // none       |    ALLOW          |  allow
+    // none       |    BOTH           |  block
+    // none       |    wifi           |  WiFi-data-block
+    // none       |    mobile         |  mobile-data-block
+    enum class FirewallStatus(val id: Int) {
+        BYPASS_UNIVERSAL(2),
+        EXCLUDE(3),
+        ISOLATE(4),
+        NONE(5),
+        // UNTRACKED(6), unused, remove in future
+        BYPASS_DNS_FIREWALL(7);
+
+        companion object {
+
+            private const val LABEL_INDEX_NONE_0 = 0
+            private const val LABEL_INDEX_NONE_1 = 1
+            private const val LABEL_INDEX_NONE_2 = 2
+            private const val LABEL_INDEX_NONE_3 = 3
+            private const val LABEL_INDEX_ISOLATE = 4
+            private const val LABEL_INDEX_BYPASS_DNS_FIREWALL = 5
+            private const val LABEL_INDEX_BYPASS_UNIVERSAL = 6
+            private const val LABEL_INDEX_EXCLUDE = 7
+
+
+            fun getStatus(id: Int): FirewallStatus {
+                return when (id) {
+                    BYPASS_UNIVERSAL.id -> {
+                        BYPASS_UNIVERSAL
+                    }
+
+                    EXCLUDE.id -> {
+                        EXCLUDE
+                    }
+
+                    ISOLATE.id -> {
+                        ISOLATE
+                    }
+
+                    BYPASS_DNS_FIREWALL.id -> {
+                        BYPASS_DNS_FIREWALL
+                    }
+
+                    else -> {
+                        NONE
+                    }
+                }
+            }
+
+            fun getStatusByLabel(id: Int): FirewallStatus {
+                return when (id) {
+                    LABEL_INDEX_NONE_0 -> {
+                        NONE
+                    }
+
+                    LABEL_INDEX_NONE_1 -> {
+                        NONE
+                    }
+
+                    LABEL_INDEX_NONE_2 -> {
+                        NONE
+                    }
+
+                    LABEL_INDEX_NONE_3 -> {
+                        NONE
+                    }
+
+                    LABEL_INDEX_ISOLATE -> {
+                        ISOLATE
+                    }
+
+                    LABEL_INDEX_BYPASS_DNS_FIREWALL -> {
+                        BYPASS_DNS_FIREWALL
+                    }
+
+                    LABEL_INDEX_BYPASS_UNIVERSAL -> {
+                        BYPASS_UNIVERSAL
+                    }
+
+                    LABEL_INDEX_EXCLUDE -> {
+                        EXCLUDE
+                    }
+
+                    else -> {
+                        NONE
+                    }
+                }
+            }
+        }
+
+        fun bypassUniversal(): Boolean {
+            return this == BYPASS_UNIVERSAL
+        }
+
+        fun bypassDnsFirewall(): Boolean {
+            return this == BYPASS_DNS_FIREWALL
+        }
+
+        fun isExclude(): Boolean {
+            return this == EXCLUDE
+        }
+
+        fun isIsolate(): Boolean {
+            return this == ISOLATE
+        }
+
+        fun isolate(): Boolean {
+            return this == ISOLATE
+        }
+    }
+
+    enum class ConnectionStatus(val id: Int) {
+        BOTH(0),
+        UNMETERED(1),
+        METERED(2),
+        ALLOW(3);
+
+        fun mobileData(): Boolean {
+            return this == METERED
+        }
+
+        fun wifi(): Boolean {
+            return this == UNMETERED
+        }
+
+        fun blocked(): Boolean {
+            return this == BOTH
+        }
+
+        fun allow(): Boolean {
+            return this == ALLOW
+        }
+
+        companion object {
+
+            private const val LABEL_INDEX_ALLOW = 0
+            private const val LABEL_INDEX_BOTH = 1
+            private const val LABEL_INDEX_UNMETERED = 2
+            private const val LABEL_INDEX_METERED = 3
+            private const val LABEL_INDEX_ALLOW_4 = 4
+            private const val LABEL_INDEX_ALLOW_5 = 5
+
+            fun getStatus(id: Int): ConnectionStatus {
+                return when (id) {
+                    BOTH.id -> {
+                        BOTH
+                    }
+
+                    UNMETERED.id -> {
+                        UNMETERED
+                    }
+
+                    METERED.id -> {
+                        METERED
+                    }
+
+                    ALLOW.id -> {
+                        ALLOW
+                    }
+
+                    else -> {
+                        ALLOW
+                    }
+                }
+            }
+
+            fun getStatusByLabel(id: Int): ConnectionStatus {
+                return when (id) {
+                    LABEL_INDEX_ALLOW -> {
+                        ALLOW
+                    }
+
+                    LABEL_INDEX_BOTH -> {
+                        BOTH
+                    }
+
+                    LABEL_INDEX_UNMETERED -> {
+                        UNMETERED
+                    }
+
+                    LABEL_INDEX_METERED -> {
+                        METERED
+                    }
+
+                    LABEL_INDEX_ALLOW_4 -> {
+                        ALLOW
+                    }
+
+                    LABEL_INDEX_ALLOW_5 -> {
+                        ALLOW
+                    }
+
+                    else -> {
+                        ALLOW
+                    }
+                }
+            }
+        }
+    }
+
+    // Firewall app category constants
+    enum class CategoryConstants(val nameResId: Int) {
+        SYSTEM_COMPONENT(R.string.category_name_sys_components),
+        SYSTEM_APP(R.string.category_name_sys_apps),
+        OTHER(R.string.category_name_others),
+        NON_APP(R.string.category_name_non_app_sys),
+        INSTALLED(R.string.category_name_installed)
+    }
+
+    object GlobalVariable {
+
+        var appInfos: Multimap<Int, AppInfo> = HashMultimap.create()
+
+        // ConcurrentHashMap-backed key set:
+        // - reads (contains) are lock-free volatile reads -> safe on the VPN packet path
+        //   (TunFirewallManager.isAppForeground runs on the Go bridge dispatchers).
+        // - writes (add/clear) are thread-safe, non-blocking and work from both coroutine
+        //   (trackForegroundApp on Dispatchers.IO) and binder (accessibility service) contexts.
+        // - @Volatile is unnecessary: the reference is never reassigned and CHM provides
+        //   its own visibility guarantees for the contents.
+        // A Mutex is the right tool only when both sides are suspendable. Here, one side is a raw
+        // callback thread (accessibility binder) and the other is a non-suspend packet-path
+        // function — a lock-free concurrent collection is the only fit that is both thread-safe
+        // and non-blocking.
+        val foregroundUids: MutableSet<Int> = ConcurrentHashMap.newKeySet()
+
+        var appInfosLiveData: MutableLiveData<Collection<AppInfo>> = MutableLiveData()
+
+        // TEMP ALLOW: keep the source-of-truth in DB; in-memory cache is only for fast checks.
+        // Note: Do not use this map anymore. Kept for backward binary compatibility; may be removed later.
+        @Deprecated("Use tempAllowCache")
+        @Suppress("unused")
+        @Volatile var tempAllowedUids: MutableMap<Int, Long> = mutableMapOf()
+    }
+
+    // temp Allow (15 min) cache + DB
+
+    private val tempAllowDbExecutor: Executor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "fw-temp-allow-db").apply { isDaemon = true }
+    }
+
+    /**
+     * Cache(uid -> expiryEpochMs).
+     * Note: Guava's variable-expiry API isn't available here; we use a fixed max TTL and treat
+     * the stored value as the real expiry.
+     */
+    private val tempAllowCache: Cache<Int, Long> = CacheBuilder.newBuilder()
+        .maximumSize(10_000)
+        // Hard upper bound; real expiry is based on stored expiryEpochMs.
+        .expireAfterWrite(Duration.ofMinutes(60))
+        .removalListener(
+            RemovalListener<Int, Long> { notification ->
+                val uid = notification.key ?: return@RemovalListener
+                val expiry = notification.value ?: return@RemovalListener
+
+                if (notification.cause == RemovalCause.EXPIRED) {
+                    tempAllowDbExecutor.execute {
+                        runCatching {
+                            db.clearTempAllowByUidIfExpiryBlocking(uid, expiry)
+                        }.onFailure { t ->
+                            Logger.e(LOG_TAG_FIREWALL, "err clearing expired temp allow: ${t.message}", t as? Exception)
+                        }
+                    }
+                }
+            }
+        )
+        .build()
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    private fun io(f: suspend () -> Unit) {
+        scope.launch { f() }
+    }
+
+    init {
+        io {
+            try {
+                load()
+            } catch (e: Exception) {
+                Logger.w(LOG_TAG_FIREWALL, "err loading app infos during init: ${e.message}")
+            }
+        }
+        io {
+            try {
+                hydrateTempAllowCacheFromDb()
+            } catch (e: Exception) {
+                Logger.w(LOG_TAG_FIREWALL, "err hydrating temp-allow cache during init: ${e.message}")
+            }
+        }
+    }
+
+    private var appContext: Context? = null
+
+    /** Called from Application / Service once to enable WorkManager scheduling. */
+    fun initTempAllowScheduler(context: Context) {
+        appContext = context.applicationContext
+        // best-effort: ensure any pending expiry work is scheduled based on DB state
+        TempAllowExpiryWorker.scheduleNext(context.applicationContext)
+    }
+
+    private fun scheduleTempAllowExpiryIfPossible() {
+        val ctx = appContext ?: return
+        TempAllowExpiryWorker.scheduleNext(ctx)
+    }
+
+    private fun cancelTempAllowExpiryIfPossible() {
+        val ctx = appContext ?: return
+        TempAllowExpiryWorker.cancel(ctx)
+    }
+
+    private suspend fun hydrateTempAllowCacheFromDb() {
+        val now = System.currentTimeMillis()
+        val apps = try {
+            db.getTempAllowedApps()
+        } catch (e: Exception) {
+            Logger.e(LOG_TAG_FIREWALL, "err hydrate temp allows: ${e.message}", e)
+            emptyList()
+        }
+
+        var hasAny = false
+        apps.forEach { ai ->
+            if (!ai.tempAllowEnabled) return@forEach
+            val expiry = ai.tempAllowExpiryTime
+            if (expiry <= now) {
+                try {
+                    db.clearTempAllowByUidIfExpiry(ai.uid, expiry)
+                } catch (e: Exception) {
+                    Logger.e(LOG_TAG_FIREWALL, "err clearing stale temp allow: ${e.message}", e)
+                }
+                return@forEach
+            }
+            hasAny = true
+            tempAllowCache.put(ai.uid, expiry)
+        }
+
+        // schedule/cancel based on presence
+        if (hasAny) scheduleTempAllowExpiryIfPossible() else cancelTempAllowExpiryIfPossible()
+    }
+
+    suspend fun isUidFirewalled(uid: Int): Boolean {
+        // see if the UID is firewalled in both metered and unmetered
+        return connectionStatus(uid) == ConnectionStatus.BOTH
+    }
+
+    suspend fun isUidSystemApp(uid: Int): Boolean {
+        mutex.withLock {
+            return appInfos.get(uid).any { it.isSystemApp }
+        }
+    }
+
+    suspend fun getAllApps(): Set<AppInfoTuple> {
+        mutex.withLock {
+            // return all apps including tombstoned ones; callers filter if needed
+            return appInfos.values().map { AppInfoTuple(it.uid, it.packageName) }.toSet()
+        }
+    }
+
+    // snapshot of the full AppInfo collection (uid+packageName -> AppInfo)
+    suspend fun getAppInfoSnapshot(): Map<Pair<Int, String>, AppInfo> {
+        return snapshotAppInfos().associateBy { Pair(it.uid, it.packageName) }
+    }
+
+    suspend fun tombstoneApp(uid: Int, packageName: String?, ts: Long = System.currentTimeMillis()) {
+        val newUid = if (uid > 0) -1 * uid else uid // use negative uid to mark the app as tombstone
+        mutex.withLock {
+            val iter = appInfos.get(uid).iterator()
+            while (iter.hasNext()) {
+                val ai = iter.next()
+                if (ai.packageName == packageName) {
+                    iter.remove() // safe removal while iterating
+                    ai.uid = newUid
+                    ai.tombstoneTs = ts
+                    ai.modifiedTs = ts
+                    appInfos.put(newUid, ai)
+                    break
+                }
+            }
+        }
+        db.tombstoneApp(uid, newUid, packageName, ts)
+        Logger.d(LOG_TAG_FIREWALL, "tombstone app: $packageName, uid: $uid, ts: $ts, newUid: $newUid")
+        informObservers()
+    }
+
+    suspend fun deletePackage(uid: Int, packageName: String?) {
+        mutex.withLock {
+            val iter = appInfos.get(uid).iterator()
+            while (iter.hasNext()) {
+                val ai = iter.next()
+                if (ai.packageName == packageName) {
+                    iter.remove() // safe removal while iterating
+                    break
+                }
+            }
+        }
+        // Delete the uninstalled apps from database
+        db.deletePackage(uid, packageName)
+    }
+
+    suspend fun clearAllApps() {
+        mutex.withLock { appInfos.clear() }
+        try {
+            db.deleteAll()
+        } catch (e: Exception) {
+            Logger.w(LOG_TAG_FIREWALL, "clearAllApps failed", e)
+        }
+        informObservers()
+    }
+
+    suspend fun getNonFirewalledAppsPackageNames(): List<AppInfo> {
+        mutex.withLock {
+            return appInfos.values().filter { it.connectionStatus == ConnectionStatus.ALLOW.id }
+        }
+    }
+
+    // TODO: Use the package-manager API instead
+    suspend fun isOrbotInstalled(): Boolean {
+        mutex.withLock {
+            return appInfos.values().any { it.packageName == OrbotHelper.ORBOT_PACKAGE_NAME && it.tombstoneTs == 0L }
+        }
+    }
+
+    suspend fun hasUid(uid: Int): Boolean {
+        mutex.withLock {
+            val appInfo = appInfos.get(uid)
+            return appInfo.isNotEmpty()
+        }
+    }
+
+    suspend fun isTombstone(packageName: String): Boolean {
+        mutex.withLock {
+            return try {
+                appInfos.values().any {
+                    it.packageName == packageName && it.tombstoneTs > 0L
+                }
+            } catch (e: NoSuchElementException) {
+                Logger.w(LOG_TAG_FIREWALL, "isTombstone iterator fault, using fallback: ${e.message}")
+                appInfos.asMap().values.flatten().any {
+                    it.packageName == packageName && it.tombstoneTs > 0L
+                }
+            } catch (e: Exception) {
+                Logger.e(LOG_TAG_FIREWALL, "isTombstone failed: ${e.message}", e)
+                false
+            }
+        }
+    }
+
+    suspend fun appStatus(uid: Int): FirewallStatus {
+        val appInfo = getAppInfoByUid(uid) ?: return FirewallStatus.NONE
+
+        return when (appInfo.firewallStatus) {
+            FirewallStatus.BYPASS_UNIVERSAL.id -> FirewallStatus.BYPASS_UNIVERSAL
+            FirewallStatus.EXCLUDE.id -> FirewallStatus.EXCLUDE
+            FirewallStatus.NONE.id -> FirewallStatus.NONE
+            FirewallStatus.ISOLATE.id -> FirewallStatus.ISOLATE
+            FirewallStatus.BYPASS_DNS_FIREWALL.id -> FirewallStatus.BYPASS_DNS_FIREWALL
+            else -> FirewallStatus.NONE
+        }
+    }
+
+    suspend fun connectionStatus(uid: Int): ConnectionStatus {
+        val appInfo = getAppInfoByUid(uid) ?: return ConnectionStatus.ALLOW
+        return when (appInfo.connectionStatus) {
+            ConnectionStatus.METERED.id -> ConnectionStatus.METERED
+            ConnectionStatus.UNMETERED.id -> ConnectionStatus.UNMETERED
+            ConnectionStatus.BOTH.id -> ConnectionStatus.BOTH
+            ConnectionStatus.ALLOW.id -> ConnectionStatus.ALLOW
+            else -> ConnectionStatus.ALLOW
+        }
+    }
+
+    fun getApplistObserver(): MutableLiveData<Collection<AppInfo>> {
+        return appInfosLiveData
+    }
+
+    suspend fun getExcludedApps(): MutableSet<String> {
+        mutex.withLock {
+            return appInfos
+                .values()
+                .filter { it.firewallStatus == FirewallStatus.EXCLUDE.id && it.tombstoneTs == 0L }
+                .map { it.packageName }
+                .toMutableSet()
+        }
+    }
+
+    // any app is bypassed both dns and firewall
+    suspend fun isAnyAppBypassesDns(): Boolean {
+        mutex.withLock {
+            return appInfos.values().any {
+                it.firewallStatus == FirewallStatus.BYPASS_DNS_FIREWALL.id &&
+                it.tombstoneTs == 0L
+            }
+        }
+    }
+
+    suspend fun getPackageNameByAppName(appName: String?): String? {
+        mutex.withLock {
+            return appInfos.values().firstOrNull { it.appName == appName }?.packageName
+        }
+    }
+
+    suspend fun getAppNamesByUid(uid: Int): List<String> {
+        mutex.withLock {
+            return appInfos.get(uid).map { it.appName }
+        }
+    }
+
+    suspend fun getPackageNamesByUid(uid: Int): List<String> {
+        mutex.withLock {
+            return appInfos.get(uid).map { it.packageName }
+        }
+    }
+
+    suspend fun getAllAppNames(): List<String> {
+        return getAppInfos().map { it.appName }.sortedBy { it.lowercase() }
+    }
+
+    suspend fun getAllAppNamesSortedByVpnPermission(context: Context): List<String> {
+        val appInfos = getAppInfos()
+        val packageManager = context.packageManager
+
+        // separate apps with and without VPN permission
+        val appsWithVpnPermission = mutableListOf<String>()
+        val appsWithoutVpnPermission = mutableListOf<String>()
+
+        appInfos.forEach { appInfo ->
+            // skip the app itself
+            if (appInfo.packageName == RETHINK_PACKAGE) {
+                return@forEach
+            }
+            // skip apps which do not have internet permission
+            if (!appInfo.hasInternetPermission(packageManager)) {
+                return@forEach
+            }
+            // skip tombstoned apps
+            if (appInfo.tombstoneTs > 0L) {
+                return@forEach
+            }
+            val hasVpnPermission = try {
+                val packageInfo = packageManager.getPackageInfo(appInfo.packageName, PackageManager.GET_SERVICES)
+                packageInfo.isVpnRelatedApp(packageManager)
+            } catch (_: Exception) {
+                false
+            }
+
+            if (hasVpnPermission) {
+                appsWithVpnPermission.add(appInfo.appName)
+            } else {
+                appsWithoutVpnPermission.add(appInfo.appName)
+            }
+        }
+
+        // sort each group alphabetically and combine with the list of apps
+        return appsWithVpnPermission.sortedBy { it.lowercase() } +
+               appsWithoutVpnPermission.sortedBy { it.lowercase() }
+    }
+
+    private fun PackageInfo.isVpnRelatedApp(pm: PackageManager): Boolean {
+        val vpnServiceStr = "android.net.VpnService"
+        val hasVpnService = services?.any {
+            it.permission == android.Manifest.permission.BIND_VPN_SERVICE
+        } ?: false
+
+        val hasVpnIntent = pm.queryIntentServices(
+            Intent(vpnServiceStr).apply { `package` = packageName },
+            PackageManager.MATCH_ALL
+        ).isNotEmpty()
+
+        return hasVpnService || hasVpnIntent
+    }
+
+    suspend fun getAppNameByUid(uid: Int): String? {
+        mutex.withLock {
+            return appInfos.get(uid).firstOrNull()?.appName
+        }
+    }
+
+    suspend fun getAppInfoByPackage(packageName: String?): AppInfo? {
+        if (packageName.isNullOrBlank()) return null
+        mutex.withLock {
+            return appInfos.values().firstOrNull { it.packageName == packageName }
+        }
+    }
+
+    // resolve the AppInfo that matches BOTH uid and packageName. This is required because the same
+    // packageName can legitimately exist under multiple uids (work-profile / cloned / dual-messenger
+    // apps, or shared-uid apps). getAppInfoByPackage() only returns the first match and must not be
+    // used when the caller already knows the uid, otherwise sibling uid entries get dropped.
+    suspend fun getAppInfoByUidAndPackage(uid: Int, packageName: String?): AppInfo? {
+        if (packageName.isNullOrBlank()) return null
+        mutex.withLock {
+            return appInfos.get(uid).firstOrNull { it.packageName == packageName }
+        }
+    }
+
+    suspend fun getAppInfoByUid(uid: Int): AppInfo? {
+        mutex.withLock {
+            return appInfos.get(uid).firstOrNull()
+        }
+    }
+
+    suspend fun getPackageNameByUid(uid: Int): String? {
+        mutex.withLock {
+            return appInfos.get(uid).firstOrNull()?.packageName
+        }
+    }
+
+    suspend fun getCategoriesForSystemApps(): List<String> {
+        return getAppInfos().filter { it.isSystemApp }.map { it.appCategory }.distinct().sorted()
+    }
+
+    suspend fun getCategoriesForInstalledApps(): List<String> {
+        return getAppInfos().filter { !it.isSystemApp }.map { it.appCategory }.distinct().sorted()
+    }
+
+    suspend fun getAllCategories(): List<String> {
+        return getAppInfos().map { it.appCategory }.distinct().sorted()
+    }
+
+    private suspend fun invalidateFirewallStatus(
+        uid: Int,
+        firewallStatus: FirewallStatus,
+        connectionStatus: ConnectionStatus
+    ) {
+        val now = System.currentTimeMillis()
+        mutex.withLock {
+            appInfos.get(uid).forEach {
+                it.firewallStatus = firewallStatus.id
+                it.connectionStatus = connectionStatus.id
+                it.modifiedTs = now
+            }
+        }
+        informObservers()
+        closeConnectionsIfNeeded(uid, firewallStatus, connectionStatus)
+    }
+
+    private suspend fun closeConnectionsIfNeeded(
+        uid: Int,
+        firewallStatus: FirewallStatus,
+        connectionStatus: ConnectionStatus
+    ) {
+        if (firewallStatus == FirewallStatus.ISOLATE) {
+            VpnController.closeConnectionsIfNeeded(uid, "isolate-manual-close")
+        } else if (
+            firewallStatus == FirewallStatus.NONE && connectionStatus != ConnectionStatus.ALLOW
+        ) {
+            VpnController.closeConnectionsIfNeeded(uid, "block-manual-close")
+        } else {
+            // no-op, no need to close existing connections, if the app is not isolated or blocked
+        }
+    }
+
+    suspend fun updateUidAndResetTombstone(oldUid: Int, newUid: Int, pkg: String) {
+        // while updating the package reset the tombstone timestamp
+        var cacheok = false
+        val appInfo = getAppInfoByUid(oldUid)
+        Logger.i(LOG_TAG_FIREWALL, "updateUidAndResetTombstone: $oldUid -> $newUid; has? ${appInfo?.packageName} == $pkg")
+        val now = System.currentTimeMillis()
+        var mutatedAi: AppInfo? = null
+        var originalTombstoneTs = 0L
+        mutex.withLock {
+            val iter = appInfos.get(oldUid).iterator()
+            while (iter.hasNext()) {
+                val ai = iter.next()
+                if (ai.packageName == pkg) {
+                    iter.remove() // safe removal while iterating
+                    originalTombstoneTs = ai.tombstoneTs
+                    ai.uid = newUid
+                    ai.tombstoneTs = 0
+                    ai.modifiedTs = now
+                    appInfos.put(newUid, ai)
+                    mutatedAi = ai
+                    cacheok = true
+                    break
+                }
+            }
+        }
+
+        val dbok = try {
+            db.updateUid(oldUid, newUid, pkg)
+        } catch (e: Exception) {
+            Logger.w(LOG_TAG_FIREWALL, "updateUid failed for ($oldUid, $pkg) -> $newUid; attempting delete+insert fallback", e)
+            try {
+                val ai = getAppInfoByUid(newUid)
+                if (ai != null) {
+                    db.deletePackage(oldUid, pkg)
+                    db.insert(ai)
+                    1
+                } else {
+                    0
+                }
+            } catch (e2: Exception) {
+                Logger.w(LOG_TAG_FIREWALL, "updateUid fallback also failed", e2)
+                // Rollback cache mutation to stay consistent with DB (which still has oldUid)
+                if (cacheok && mutatedAi != null) {
+                    mutex.withLock {
+                        appInfos.remove(newUid, mutatedAi)
+                        mutatedAi.uid = oldUid
+                        mutatedAi.tombstoneTs = originalTombstoneTs
+                        appInfos.put(oldUid, mutatedAi)
+                    }
+                    Logger.w(LOG_TAG_FIREWALL, "rolled back cache for $pkg: $newUid -> $oldUid")
+                }
+                0
+            }
+        }
+        Logger.d(LOG_TAG_FIREWALL, "update: $pkg; $oldUid -> $newUid; c? $cacheok; db? $dbok")
+        informObservers()
+    }
+
+    suspend fun persistAppInfo(appInfo: AppInfo) {
+        db.insert(appInfo)
+
+        mutex.withLock { appInfos.put(appInfo.uid, appInfo) }
+        informObservers()
+    }
+
+    suspend fun load(): Int {
+        val apps = try {
+            db.getAppInfo()
+        } catch (e: Exception) {
+            Logger.w(LOG_TAG_FIREWALL, "load db failed", e)
+            return 0
+        }
+        if (apps.isEmpty()) {
+            Logger.w(LOG_TAG_FIREWALL, "no apps found in db, no app-based rules to load")
+            return 0
+        }
+
+        mutex.withLock {
+            appInfos.clear()
+            apps.forEach { appInfos.put(it.uid, it) }
+        }
+        informObservers()
+        return apps.size
+    }
+
+    fun untrackForegroundApps() {
+        Logger.i(
+            LOG_TAG_FIREWALL,
+            "launcher in the foreground, clear foreground uids: $foregroundUids"
+        )
+        foregroundUids.clear()
+    }
+
+    fun trackForegroundApp(uid: Int) {
+        io {
+            mutex.withLock {
+                val appInfo = appInfos[uid]
+
+                if (appInfo.isEmpty()) {
+                    Logger.i(
+                        LOG_TAG_FIREWALL,
+                        "No such app $uid to update 'dis/allow' firewall rule"
+                    )
+                    return@io
+                }
+            }
+            val isAppUid = AndroidUidConfig.isUidAppRange(uid)
+            Logger.d(LOG_TAG_FIREWALL, "app in foreground; uid($uid)? $isAppUid")
+
+            // Only track packages within app uid range.
+            if (!isAppUid) return@io
+
+            foregroundUids.add(uid)
+        }
+    }
+
+    fun isAppForeground(uid: Int, keyguardManager: KeyguardManager?): Boolean {
+        // isKeyguardLocked check for allow apps in foreground.
+        // When the user engages the app and locks the screen, the app is
+        // considered to be in background and the connections for those apps
+        // should be blocked.
+        val locked = keyguardManager?.isKeyguardLocked == true
+        val inForegroundList = foregroundUids.contains(uid)
+        Logger.d(
+            LOG_TAG_FIREWALL,
+            "is app $uid foreground? ${!locked && inForegroundList}, isLocked? $locked, in foreground list? $inForegroundList"
+        )
+        return !locked && inForegroundList
+    }
+
+    suspend fun updateFirewalledApps(uid: Int, connectionStatus: ConnectionStatus) {
+        withAppUpdateLock(uid) {
+            try {
+                db.updateFirewallStatusByUid(uid, FirewallStatus.NONE.id, connectionStatus.id)
+            } catch (e: Exception) {
+                Logger.w(LOG_TAG_FIREWALL, "updateFirewalledApps db failed for uid $uid", e)
+                return@withAppUpdateLock
+            }
+            invalidateFirewallStatus(uid, FirewallStatus.NONE, connectionStatus)
+        }
+    }
+
+    suspend fun updateFirewallStatus(
+        uid: Int,
+        firewallStatus: FirewallStatus,
+        connectionStatus: ConnectionStatus
+    ) {
+        Logger.i(
+            LOG_TAG_FIREWALL,
+            "Apply firewall rule for uid: ${uid}, ${firewallStatus.name}, ${connectionStatus.name}"
+        )
+        if (isUnknownPackage(uid) && firewallStatus.isExclude()) {
+            Logger.w(LOG_TAG_FIREWALL, "Cannot exclude unknown package: $uid")
+            return
+        }
+
+        withAppUpdateLock(uid) {
+            try {
+                db.updateFirewallStatusByUid(uid, firewallStatus.id, connectionStatus.id)
+            } catch (e: Exception) {
+                Logger.w(LOG_TAG_FIREWALL, "updateFirewallStatus db failed for uid $uid", e)
+                return@withAppUpdateLock
+            }
+            invalidateFirewallStatus(uid, firewallStatus, connectionStatus)
+        }
+    }
+
+    suspend fun updateTempAllowStatus(uid: Int, durationMinutes: Int = TEMP_ALLOW_DEFAULT_MINUTES) {
+        Logger.i(LOG_TAG_FIREWALL, "Apply temporary allow for uid: $uid for $durationMinutes minutes")
+
+        if (durationMinutes <= 0) {
+            Logger.w(LOG_TAG_FIREWALL, "Invalid duration ($durationMinutes) for uid $uid, reverting temp allow")
+            revertTempAllow(uid)
+            return
+        }
+
+        val expiryTime = System.currentTimeMillis() + (durationMinutes * 60 * 1000L)
+
+        db.updateTempAllowByUid(uid, true, expiryTime)
+        tempAllowCache.put(uid, expiryTime)
+
+        scheduleTempAllowExpiryIfPossible()
+
+        Logger.i(LOG_TAG_FIREWALL, "Temporary allow applied for uid: $uid, expires at: $expiryTime")
+    }
+
+    private suspend fun revertTempAllow(uid: Int) {
+        Logger.i(LOG_TAG_FIREWALL, "Reverting temporary allow for uid: $uid")
+
+        try {
+            db.clearTempAllowByUid(uid)
+        } catch (e: Exception) {
+            Logger.w(LOG_TAG_FIREWALL, "revertTempAllow db failed for uid $uid", e)
+            return
+        }
+        tempAllowCache.invalidate(uid)
+
+        // schedule/cancel based on remaining entries (DB is source of truth)
+        scheduleTempAllowExpiryIfPossible()
+
+        Logger.i(LOG_TAG_FIREWALL, "Temporary allow reverted for uid: $uid")
+    }
+
+    suspend fun isTempAllowed(uid: Int): Boolean {
+        val now = System.currentTimeMillis()
+
+        val cachedExpiry = tempAllowCache.getIfPresent(uid)
+        if (cachedExpiry != null) {
+            return now < cachedExpiry
+        }
+
+        // Cache miss: consult DB (source of truth) and warm cache if still valid.
+        val ai = try {
+            db.getAppInfoByUid(uid)
+        } catch (_: Exception) {
+            null
+        }
+
+        if (ai?.tempAllowEnabled == true && ai.tempAllowExpiryTime > now) {
+            tempAllowCache.put(uid, ai.tempAllowExpiryTime)
+            return true
+        }
+
+        // If DB says expired/disabled, ensure cache doesn't keep it.
+        tempAllowCache.invalidate(uid)
+        return false
+    }
+
+    suspend fun updateTempAllow(uid: Int, enabled: Boolean) {
+        if (enabled) {
+            updateTempAllowStatus(uid, TEMP_ALLOW_DEFAULT_MINUTES)
+        } else {
+            revertTempAllow(uid)
+        }
+    }
+
+
+    private suspend fun getAppInfos(): Collection<AppInfo> {
+        mutex.withLock {
+            if (appInfos.isEmpty) return emptyList()
+            return appInfos.values().toList()
+        }
+    }
+
+    // labels for spinner / toggle ui
+    fun getLabel(context: Context): Array<String> {
+        return context.resources.getStringArray(R.array.firewall_rules)
+    }
+
+    fun getLabelForStatus(firewallStatus: FirewallStatus, connectionStatus: ConnectionStatus, prevConnStatus: ConnectionStatus): Int {
+        return when (firewallStatus) {
+            FirewallStatus.NONE -> {
+                when (connectionStatus) {
+                    ConnectionStatus.BOTH -> R.string.block
+                    ConnectionStatus.METERED ->
+                        if (prevConnStatus == ConnectionStatus.UNMETERED || prevConnStatus == ConnectionStatus.ALLOW) {
+                            R.string.block
+                        } else {
+                            R.string.allow
+                        }
+                    ConnectionStatus.UNMETERED ->
+                        if (prevConnStatus == ConnectionStatus.METERED || prevConnStatus == ConnectionStatus.ALLOW) {
+                            R.string.block
+                        } else {
+                            R.string.allow
+                        }
+                    ConnectionStatus.ALLOW -> R.string.allow
+                }
+            }
+            FirewallStatus.BYPASS_UNIVERSAL -> {
+                R.string.bypass_universal
+            }
+            FirewallStatus.EXCLUDE -> {
+                R.string.exclude
+            }
+            FirewallStatus.ISOLATE -> {
+                R.string.isolate
+            }
+            FirewallStatus.BYPASS_DNS_FIREWALL -> {
+                R.string.bypass_dns_firewall
+            }
+        }
+    }
+
+    fun updateIsProxyExcluded(uid: Int, isProxyExcluded: Boolean) {
+        io {
+            withAppUpdateLock(uid) {
+                try {
+                    withContext(Dispatchers.IO) {
+                        db.updateProxyExcluded(uid, isProxyExcluded)
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Logger.w(LOG_TAG_FIREWALL, "updateIsProxyExcluded db failed for uid $uid", e)
+                    return@withAppUpdateLock
+                }
+
+                updateSharedUidCacheField(uid) { appInfo ->
+                    appInfo.isProxyExcluded = isProxyExcluded
+                }
+            }
+        }
+    }
+
+    suspend fun updateAppNotes(uid: Int, packageName: String, notes: String) {
+        updatePerAppInfoField(uid, packageName, "notes",
+            dbUpdate = suspend { db.updateNotes(uid, packageName, notes) },
+            cacheUpdate = { appInfo -> appInfo.notes = notes }
+        )
+    }
+
+    private suspend fun <T> runDbUpdate(
+        uid: Int,
+        fieldName: String,
+        dbUpdate: suspend () -> T
+    ): T {
+        try {
+            return withContext(Dispatchers.IO) {
+                dbUpdate()
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Logger.w(LOG_TAG_FIREWALL, "runDbUpdate ($fieldName) failed for uid $uid", e)
+            throw e
+        }
+    }
+
+    private suspend fun updatePerAppInfoField(
+        uid: Int,
+        packageName: String,
+        fieldName: String,
+        dbUpdate: suspend () -> Int,
+        cacheUpdate: (AppInfo) -> Unit
+    ) {
+        withAppUpdateLock(uid) {
+            val rowsUpdated = runDbUpdate(uid, fieldName, dbUpdate)
+            if (rowsUpdated <= 0) {
+                Logger.w(
+                    LOG_TAG_FIREWALL,
+                    "updatePerAppInfoField ($fieldName) no rows updated for uid $uid, package $packageName"
+                )
+                throw IllegalStateException("No rows updated for uid $uid, package $packageName")
+            }
+
+            val now = System.currentTimeMillis()
+            var cacheUpdated = false
+            mutex.withLock {
+                appInfos.get(uid).find { it.packageName == packageName }?.let { appInfo ->
+                    cacheUpdate(appInfo)
+                    appInfo.modifiedTs = now
+                    cacheUpdated = true
+                } ?: Logger.w(
+                    LOG_TAG_FIREWALL,
+                    "updatePerAppInfoField ($fieldName) cache miss for uid $uid, package $packageName"
+                )
+            }
+
+            if (!cacheUpdated) {
+                val refreshedAppInfo = withContext(Dispatchers.IO) { db.getAppInfoByUidAndPackage(uid, packageName) }
+                if (refreshedAppInfo != null) {
+                    mutex.withLock {
+                        appInfos.put(uid, refreshedAppInfo)
+                        cacheUpdated = true
+                    }
+                } else {
+                    Logger.w(
+                        LOG_TAG_FIREWALL,
+                        "updatePerAppInfoField ($fieldName) db reload miss for uid $uid, package $packageName"
+                    )
+                }
+            }
+
+            if (cacheUpdated) {
+                informObservers()
+            }
+        }
+    }
+
+    private suspend fun <T> withAppUpdateLock(uid: Int, block: suspend () -> T): T {
+        val lock = appUpdateLocks.compute(uid) { _, existing ->
+            (existing ?: AppUpdateLock()).also { it.refCount += 1 }
+        }!!
+
+        try {
+            return lock.mutex.withLock { block() }
+        } finally {
+            appUpdateLocks.compute(uid) { _, existing ->
+                if (existing == null) {
+                    null
+                } else if (existing === lock) {
+                    existing.refCount -= 1
+                    if (existing.refCount <= 0) null else existing
+                } else {
+                    existing
+                }
+            }
+        }
+    }
+
+
+    private suspend fun updateSharedUidCacheField(
+        uid: Int,
+        cacheUpdate: (AppInfo) -> Unit
+    ) {
+        val now = System.currentTimeMillis()
+        mutex.withLock {
+            appInfos.get(uid).forEach { appInfo ->
+                cacheUpdate(appInfo)
+                appInfo.modifiedTs = now
+            }
+        }
+        informObservers()
+    }
+
+    suspend fun getTombstoneApps(): List<AppInfo> {
+        mutex.withLock {
+            return try {
+                appInfos.values().filter { it.tombstoneTs > 0L }
+            } catch (e: NoSuchElementException) {
+                Logger.w(LOG_TAG_FIREWALL, "getTombstoneApps iterator fault, using fallback: ${e.message}")
+                appInfos.asMap().values.flatten().filter { it.tombstoneTs > 0L }
+            } catch (e: Exception) {
+                Logger.e(LOG_TAG_FIREWALL, "getTombstoneApps failed: ${e.message}", e)
+                emptyList()
+            }
+        }
+    }
+
+    suspend fun exemptRethinkApp(rethinkUid: Int) {
+        try {
+            db.exemptRethinkApp()
+        } catch (e: Exception) {
+            Logger.w(LOG_TAG_FIREWALL, "exemptRethinkApp db failed for uid $rethinkUid", e)
+            return
+        }
+        mutex.withLock {
+            val appInfo = appInfos[rethinkUid].firstOrNull()
+            if (appInfo == null) {
+                Logger.e(LOG_TAG_FIREWALL, "appInfo is null for uid: $rethinkUid")
+                return@withLock
+            }
+
+            appInfo.connectionStatus = ConnectionStatus.ALLOW.id
+            appInfo.firewallStatus = FirewallStatus.BYPASS_DNS_FIREWALL.id
+            appInfo.isProxyExcluded = true
+            appInfo.modifiedTs = System.currentTimeMillis()
+        }
+        informObservers()
+    }
+
+    suspend fun isAppExcludedFromProxy(uid: Int): Boolean {
+        return getAppInfoByUid(uid)?.isProxyExcluded ?: false
+    }
+
+    suspend fun stats(): String {
+        // add count of apps in each firewall status
+        val statusCount = HashMap<FirewallStatus, Int>()
+        // snapshot under lock to avoid iterator faults from concurrent writes
+        mutex.withLock { appInfos.values().toList() }.forEach {
+            val status = FirewallStatus.getStatus(it.firewallStatus)
+            statusCount[status] = (statusCount[status] ?: 0) + 1
+        }
+        val sb = StringBuilder()
+        sb.append("Apps\n")
+        statusCount.forEach { (status, count) ->
+            sb.append("   ${status.name}: $count\n")
+        }
+        sb.append("Universal firewall\n")
+        sb.append("   block_http_connections: ${persistentState.getBlockHttpConnections()}\n")
+        sb.append("   block_metered_connections: ${persistentState.getBlockMeteredConnections()}\n")
+        sb.append("   universal_lockdown: ${persistentState.getUniversalLockdown()}\n")
+        sb.append("   block_newly_installed_app: ${persistentState.getBlockNewlyInstalledApp()}\n")
+        sb.append("   disallow_dns_bypass: ${persistentState.getDisallowDnsBypass()}\n")
+        sb.append("   udp_blocked: ${persistentState.getUdpBlocked()}\n")
+        sb.append("   block_unknown_connections: ${persistentState.getBlockUnknownConnections()}\n")
+        sb.append("   block_app_when_background: ${persistentState.getBlockAppWhenBackground()}\n")
+        sb.append("   block_when_device_locked: ${persistentState.getBlockWhenDeviceLocked()}\n")
+
+        return sb.toString()
+    }
+
+    data class AppInfoTuple(val uid: Int, val packageName: String)
+
+    private suspend fun snapshotAppInfos(): List<AppInfo> {
+        // Multi-level fallback strategy to handle iterator exceptions from Guava's HashMultimap
+        // These exceptions can occur even with mutex protection due to internal iterator state
+
+        // Strategy 1: Try direct toList() on values with defensive copy
+        return try {
+            mutex.withLock {
+                // Create a defensive copy to avoid iterator issues
+                val snapshot = mutableListOf<AppInfo>()
+                snapshot.addAll(appInfos.values())
+                snapshot.toList()
+            }
+        } catch (e: NoSuchElementException) {
+            Logger.w(LOG_TAG_FIREWALL, "snapshot retry after iterator fault: ${e.message}")
+
+            // Strategy 2: Try flattening from asMap (creates new view)
+            try {
+                mutex.withLock {
+                    val flattened = mutableListOf<AppInfo>()
+                    appInfos.asMap().values.forEach { values ->
+                        flattened.addAll(values)
+                    }
+                    flattened.toList()
+                }
+            } catch (e2: Exception) {
+                Logger.w(LOG_TAG_FIREWALL, "snapshot flatten failed: ${e2.message}")
+
+                // Strategy 3: Iterate keys individually (most defensive)
+                try {
+                    mutex.withLock {
+                        val result = mutableListOf<AppInfo>()
+                        val keys = try {
+                            appInfos.keySet().toList()  // Snapshot keys first
+                        } catch (ke: Exception) {
+                            Logger.w(LOG_TAG_FIREWALL, "snapshot keySet failed: ${ke.message}")
+                            emptyList<Int>()
+                        }
+                        for (uid in keys) {
+                            try {
+                                val infos = appInfos.get(uid)
+                                result.addAll(infos)
+                            } catch (ge: Exception) {
+                                // Skip this UID if it causes issues
+                                Logger.d(LOG_TAG_FIREWALL, "snapshot skipped uid $uid: ${ge.message}")
+                            }
+                        }
+                        result.toList()
+                    }
+                } catch (e3: Exception) {
+                    // Strategy 4: Last resort - return empty list (graceful degradation)
+                    Logger.e(LOG_TAG_FIREWALL, "snapshot all fallbacks failed: ${e3.message}", e3)
+                    emptyList()
+                }
+            }
+        } catch (e: ConcurrentModificationException) {
+            Logger.w(LOG_TAG_FIREWALL, "snapshot concurrent modification: ${e.message}")
+            // Retry once with fresh attempt using asMap approach
+            try {
+                mutex.withLock {
+                    val result = mutableListOf<AppInfo>()
+                    appInfos.asMap().values.forEach { values ->
+                        result.addAll(values)
+                    }
+                    result.toList()
+                }
+            } catch (retry: Exception) {
+                Logger.e(LOG_TAG_FIREWALL, "snapshot retry failed: ${retry.message}", retry)
+                emptyList()
+            }
+        } catch (e: Exception) {
+            // Catch-all for any unexpected exceptions
+            Logger.e(LOG_TAG_FIREWALL, "snapshot unexpected error: ${e.message}", e)
+            emptyList()
+        }
+    }
+
+    private suspend fun informObservers() {
+        // existing code expects this to broadcast appInfos snapshot.
+        // Use a snapshot to avoid exposing internal live collections.
+        try {
+            appInfosLiveData.postValue(snapshotAppInfos())
+        } catch (e: Exception) {
+            Logger.e(LOG_TAG_FIREWALL, "informObservers failed: ${e.message}", e)
+            // Post empty list to prevent observers from hanging
+            appInfosLiveData.postValue(emptyList())
+        }
+    }
+
+    fun isUnknownPackage(uid: Int): Boolean {
+        // Unknown uids are marked with a synthetic package prefix.
+        val pkgs = runCatching { appInfos.get(uid).map { it.packageName } }.getOrDefault(emptyList())
+        return pkgs.any { it.startsWith(AppInfoRepository.NO_PACKAGE_PREFIX) }
+    }
+}
