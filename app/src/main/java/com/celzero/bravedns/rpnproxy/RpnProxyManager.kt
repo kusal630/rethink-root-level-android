@@ -1735,7 +1735,19 @@ object RpnProxyManager : KoinComponent {
             try {
                 subscriptionStateMachine.currentState.collect { state ->
                     Logger.d(LOG_TAG_PROXY, "$TAG; collect; initial subscription state: ${state.name}")
-                    io { handleStateChange(state) }
+                    // handled in its own coroutine so one bad state never cancels the
+                    // observer, and never escapes to the default uncaught handler
+                    io {
+                        try {
+                            handleStateChange(state)
+                        } catch (e: Exception) {
+                            Logger.e(
+                                LOG_TAG_PROXY,
+                                "$TAG; collect; error handling state ${state.name}: ${e.message}",
+                                e,
+                            )
+                        }
+                    }
                 }
             } catch (e: Exception) {
                 Logger.e(LOG_TAG_PROXY, "$TAG; collect; error in state observer: ${e.message}", e)

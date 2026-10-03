@@ -39,6 +39,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.celzero.bravedns.R
 import com.celzero.bravedns.RethinkDnsApplication.Companion.DEBUG
+import com.celzero.bravedns.root.PowerGovernor
 import com.celzero.bravedns.service.FirewallManager.NOTIF_CHANNEL_ID_FIREWALL_ALERTS
 import com.celzero.bravedns.service.VpnBuilderPolicy.Companion.getNetworkBehaviourDuration
 import com.celzero.bravedns.service.WireguardManager.NOTIF_CHANNEL_ID_WIREGUARD_ALERTS
@@ -120,7 +121,7 @@ class ConnectionMonitor(private val context: Context, private val networkListene
                     true // First time, consider as changed
                 }
 
-                val shouldCheck = timeSinceLastCheck >= CONNECTIVITY_CHECK_INTERVAL_MS || networkHandlesChanged
+                val shouldCheck = timeSinceLastCheck >= PowerGovernor.current.connectivityCheckMs || networkHandlesChanged
 
                 if (shouldCheck) {
                     updateLastConnectivityCheckState(currentTime, currentNetworkHandles)

@@ -16,6 +16,7 @@
 
 package com.celzero.bravedns.util
 
+import com.celzero.bravedns.root.PowerGovernor
 import com.celzero.bravedns.util.Logger.LOG_BATCH_LOGGER
 import android.util.Log
 import kotlinx.coroutines.CoroutineDispatcher
@@ -58,7 +59,8 @@ class NetLogBatcher<T, V>(
 
     // wait time before dispatching a batch, regardless of its size
     // signal waits min waitms and max waitms*2
-    private val waitms = 2500L
+    private val waitms: Long
+        get() = PowerGovernor.current.netLogFlushMs
 
     // buffer channel, holds at most 2 buffers, and drops the oldest
     private val buffersCh = Channel<List<T>>(qsize, BufferOverflow.DROP_OLDEST)

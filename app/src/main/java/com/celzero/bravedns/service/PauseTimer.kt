@@ -15,6 +15,7 @@
  */
 package com.celzero.bravedns.service
 
+import com.celzero.bravedns.root.PowerGovernor
 import com.celzero.bravedns.util.Logger
 import com.celzero.bravedns.util.Logger.LOG_TAG_UI
 import com.celzero.bravedns.util.Logger.LOG_TAG_VPN
@@ -38,7 +39,9 @@ object PauseTimer {
 
     private val countdownMs: AtomicLong = AtomicLong(DEFAULT_PAUSE_TIME_MS)
     private val pauseCountDownTimer: MutableLiveData<Long> = MutableLiveData()
-    private const val COUNT_DOWN_INTERVAL = 1000L
+
+    private val countDownIntervalMs: Long
+        get() = PowerGovernor.current.pauseTickMs
 
     private val scope = CoroutineScope(Dispatchers.IO)
     private var countdownJob: Job? = null
@@ -53,8 +56,9 @@ object PauseTimer {
             try {
                 setCountdown(durationMs)
                 while (isActive && countdownMs.get() > 0L) {
-                    delay(COUNT_DOWN_INTERVAL.milliseconds)
-                    addCountdown(-COUNT_DOWN_INTERVAL)
+                    val tick = countDownIntervalMs
+                    delay(tick.milliseconds)
+                    addCountdown(-tick)
                 }
             } finally {
                 if (isActive) {

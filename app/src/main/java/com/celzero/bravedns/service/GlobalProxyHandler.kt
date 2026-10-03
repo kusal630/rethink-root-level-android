@@ -20,6 +20,7 @@ import com.celzero.bravedns.database.EventSource
 import com.celzero.bravedns.database.EventType
 import com.celzero.bravedns.database.Severity
 import com.celzero.bravedns.rpnproxy.RpnProxyManager
+import com.celzero.bravedns.root.PowerGovernor
 import com.celzero.bravedns.rpnproxy.RpnProxyManager.RpnType
 import com.celzero.bravedns.service.ProxyManager.ID_HTTP_BASE
 import com.celzero.bravedns.service.ProxyManager.ID_ORBOT_BASE
@@ -126,7 +127,7 @@ object GlobalProxyHandler : KoinComponent {
         if (job?.isActive == true) return
         job = scope.launch(Dispatchers.IO + CoroutineName("global-proxy-handler")) {
             while (isActive) {
-                delay(INTERVAL_MS.milliseconds)
+                delay(PowerGovernor.current.globalProxyCheckMs.milliseconds)
                 try {
                     checkAndReadd()
                 } catch (e: Exception) {

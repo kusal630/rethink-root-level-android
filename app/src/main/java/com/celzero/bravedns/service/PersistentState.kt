@@ -133,6 +133,10 @@ class PersistentState(context: Context) : SimpleKrate(context), KoinComponent {
         // memory-profile heap dumps. Empty when the user hasn't picked a location yet.
         const val MEMORY_PROFILE_DIR_URI = "memory_profile_dir_uri"
 
+        // whether the app should use root (iptables/routing) instead of the pure tun path.
+        // harmless when no su binary exists: the runtime probes and silently falls back.
+        const val ROOT_MODE_ENABLED = "root_mode_enabled"
+
         // Default custom LAN IPs for the VPN tunnel (used with the withDefault{} values
         // above and by restoreTunnelSettingsDefaults())
         private const val DEFAULT_LAN_GATEWAY_IPV4 = "10.111.222.1/24"
@@ -827,6 +831,10 @@ class PersistentState(context: Context) : SimpleKrate(context), KoinComponent {
     var blockDnsForUnknownApp by booleanPref("block_dns_for_unknown_app").withDefault<Boolean>(false)
 
     var showRethinkBlockNotification by booleanPref("show_rethink_block_notification").withDefault<Boolean>(true)
+
+    // whether to prefer root for the per-app firewall / routing / power policy. Requires a
+    // working su; the runtime falls back to the tun path when root is not granted.
+    var rootModeEnabled by booleanPref(ROOT_MODE_ENABLED).withDefault<Boolean>(true)
 
     private fun defaultAllowedDnsRecordTypes(): String {
         return setOf(

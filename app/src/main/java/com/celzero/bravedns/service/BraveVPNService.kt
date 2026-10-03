@@ -82,6 +82,10 @@ import com.celzero.bravedns.net.go.GoVpnAdapter
 import com.celzero.bravedns.net.manager.ConnectionTracer
 import com.celzero.bravedns.receiver.NotificationActionReceiver
 import com.celzero.bravedns.receiver.UserPresentReceiver
+import com.celzero.bravedns.root.PowerGovernor
+import com.celzero.bravedns.root.ProcessCommandRunner
+import com.celzero.bravedns.root.RootFirewallPolicy
+import com.celzero.bravedns.root.RootRuntime
 import com.celzero.bravedns.rpnproxy.RpnProxyManager
 import com.celzero.bravedns.rpnproxy.RpnProxyManager.RpnType
 import com.celzero.bravedns.scheduler.RpnProxyUpdateWorker
@@ -152,6 +156,7 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.currentCoroutineContext
@@ -159,6 +164,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
@@ -215,6 +221,22 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
     private val upstreamQueryDispatcher by lazy { Daemons.ioDispatcher("upstreamQ", DNSOpts(), vpnScope) }
 
     private val wgProxyPingController by lazy { WgProxyPingController(vpnScope) }
+
+    // Root mode: probes `su`, owns the OUTPUT drop chain and selects the active
+    // PowerGovernor profile. Constructed (but never executed) lazily so that the whole
+    // subsystem stays inert — and cheap — when root mode is switched off.
+    private val rootRuntime: RootRuntime by
+        lazy {
+            RootRuntime(ProcessCommandRunner(), log = { Logger.d(LOG_TAG_VPN, it) })
+        }
+
+    // Snapshot of the routing decision made by the most recent newBuilder() run. The
+    // kernel drop rules may only be installed for uids whose traffic actually reaches
+    // the tun, so anything excluded here is reported as "not in tunnel" to the policy.
+    private val builderDisallowedAccum: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    @Volatile private var builderDisallowedPkgs: Set<String> = emptySet()
+    @Volatile private var builderAllowsBypass: Boolean = false
+    private var rootCounterJob: Job? = null
 
     // TODO: remove volatile
     @Volatile
@@ -583,6 +605,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
      * [Builder.establish].
      */
     private suspend fun newBuilder(): Builder {
+        builderDisallowedAccum.clear()
         val builder = Builder()
         val underlyingNws = getUnderlays()
         // prefer view of underlying networks over vpn service lockdown state for being consistent
@@ -626,6 +649,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
             val packages = nonFirewalledApps.map { it.packageName }
             Logger.i(LOG_TAG_VPN, "paused, exclude non-firewalled apps, size: ${packages.count()}")
             addDisallowedApplications(builder, packages)
+            recordBuilderExclusions(vpnLockdown)
             return builder
         }
 
@@ -689,7 +713,14 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
             }
         }
 
+        recordBuilderExclusions(vpnLockdown)
         return builder
+    }
+
+    /** Publishes what this builder run actually routed, for the root firewall policy. */
+    private fun recordBuilderExclusions(vpnLockdown: Boolean) {
+        builderDisallowedPkgs = builderDisallowedAccum.toSet()
+        builderAllowsBypass = !vpnLockdown && persistentState.allowBypass
     }
 
     private fun isExcludeProxyApp(appName: String?): Boolean {
@@ -706,6 +737,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
         try {
             Logger.d(LOG_TAG_VPN, "builder: exclude app: $pkg")
             builder.addDisallowedApplication(pkg)
+            builderDisallowedAccum.add(pkg)
         } catch (e: PackageManager.NameNotFoundException) {
             Logger.w(LOG_TAG_VPN, "builder: skip adding disallowed app ($pkg)", e)
         }
@@ -722,6 +754,138 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
             } catch (e: PackageManager.NameNotFoundException) {
                 Logger.w(LOG_TAG_VPN, "skip adding allowed app ($it)", e)
             }
+        }
+    }
+
+    // ── root-mode firewall ─────────────────────────────────────────────────────
+
+    /**
+     * Selects the power profile synchronously (a plain object swap) and then kicks off
+     * the blocking `su` probe on the IO pool.
+     *
+     * The profile is chosen up front because [ConnectionMonitor] schedules its first
+     * link check from the same `ui {}` block, and that check must already see the
+     * root cadence.
+     */
+    private fun startRootRuntime() {
+        if (!persistentState.rootModeEnabled) {
+            PowerGovernor.select(root = false)
+            return
+        }
+        PowerGovernor.select(root = true)
+        io("rootFirewall") {
+            if (rootRuntime.activate()) {
+                startRootCounterPoll()
+                syncRootFirewall("vpn-start")
+            } else {
+                PowerGovernor.select(root = false)
+                Logger.i(LOG_TAG_VPN, "root mode requested but unavailable; using tun firewall")
+            }
+        }
+    }
+
+    private fun stopRootRuntime() {
+        rootCounterJob?.cancel()
+        rootCounterJob = null
+        if (!rootRuntime.isEngaged) return
+        io("rootFirewallStop") { rootRuntime.deactivate() }
+    }
+
+    /** Reads the kernel drop counters on the profile's cadence. */
+    private fun startRootCounterPoll() {
+        if (rootCounterJob?.isActive == true) return
+        rootCounterJob =
+            vpnScope.launch(CoroutineName("rootCounters") + Dispatchers.IO) {
+                while (isActive) {
+                    delay(PowerGovernor.current.kernelRulePollMs.milliseconds)
+                    try {
+                        val dropped = rootRuntime.counters()
+                        if (dropped.isNotEmpty()) {
+                            Logger.v(LOG_TAG_VPN, "kernel drops by uid: $dropped")
+                        }
+                    } catch (e: Exception) {
+                        Logger.w(LOG_TAG_VPN, "root counter poll failed: ${e.message}")
+                    }
+                }
+            }
+    }
+
+    /**
+     * Recomputes which uids the kernel may drop and applies the difference.
+     *
+     * Cheap when nothing moved: [RootRuntime.sync] short-circuits before it shells out,
+     * and the diff itself only programs uids that actually changed state.
+     */
+    private suspend fun syncRootFirewall(reason: String) {
+        if (!rootRuntime.isEngaged) return
+        try {
+            val policyScope =
+                RootFirewallPolicy.Scope(
+                    firewallActive = appConfig.determineFirewallMode() != AppConfig.TunFirewallMode.NONE,
+                    lockdown = false,
+                    tunnelMayBeBypassed = builderAllowsBypass,
+                    selfUid = Process.myUid(),
+                    notInTunnel = uidsOutsideTunnel(),
+                    proxySetupUids = proxySetupUids(),
+                )
+            val desired = RootFirewallPolicy.select(currentAppRules(), policyScope)
+            if (rootRuntime.sync(desired)) {
+                Logger.d(LOG_TAG_VPN, "root firewall synced ($reason): ${desired.size} uids")
+            }
+        } catch (e: Exception) {
+            Logger.w(LOG_TAG_VPN, "root firewall sync failed ($reason): ${e.message}")
+        }
+    }
+
+    /**
+     * Reduced per-app verdicts, in exactly the shape the policy wants. Resolved through
+     * [FirewallManager] so the kernel rule set and the tun rule set can never disagree
+     * about what "blocked" means for a given uid.
+     */
+    private suspend fun currentAppRules(): List<RootFirewallPolicy.AppRule> {
+        val snapshot = FirewallManager.getAppInfoSnapshot()
+        val byUid = snapshot.entries.groupBy({ it.key.first }, { it.value })
+        val rules = ArrayList<RootFirewallPolicy.AppRule>(byUid.size)
+        for ((uid, apps) in byUid) {
+            if (uid <= 0) continue
+            // tombstoned packages are uninstalled; leave their uid to the tun path
+            if (apps.all { it.tombstoneTs != 0L }) continue
+            rules +=
+                RootFirewallPolicy.AppRule(
+                    uid = uid,
+                    denyAll = FirewallManager.connectionStatus(uid).blocked(),
+                    tempAllowed = FirewallManager.isTempAllowed(uid),
+                    excluded =
+                        FirewallManager.appStatus(uid) == FirewallManager.FirewallStatus.EXCLUDE,
+                    tracked = true,
+                )
+        }
+        return rules
+    }
+
+    /** Uids whose traffic never enters the tun, taken from the last builder run. */
+    private fun uidsOutsideTunnel(): Set<Int> {
+        val excluded = builderDisallowedPkgs
+        if (excluded.isEmpty()) return emptySet()
+        val pm = packageManager
+        val uids = HashSet<Int>(excluded.size)
+        for (pkg in excluded) {
+            try {
+                uids += pm.getApplicationInfo(pkg, 0).uid
+            } catch (_: PackageManager.NameNotFoundException) {
+                // package went away; it cannot emit traffic either
+            }
+        }
+        return uids
+    }
+
+    /** Orbot's uid must never be pre-empted while it is being set up. */
+    private fun proxySetupUids(): Set<Int> {
+        if (!settingUpOrbot.get()) return emptySet()
+        return try {
+            setOf(packageManager.getApplicationInfo(OrbotHelper.ORBOT_PACKAGE_NAME, 0).uid)
+        } catch (_: PackageManager.NameNotFoundException) {
+            emptySet()
         }
     }
 
@@ -812,6 +976,10 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
         return Observer { t ->
             io("appObsrver") {
                 try {
+                    // per-app verdicts may have changed even when the exclude list did
+                    // not; the kernel rule set has to track them either way
+                    syncRootFirewall("app-infos")
+
                     var latestExcludedApps: Set<String>
                     excludeAppsMutex.withLock {
                         val copy: List<AppInfo> = mutableListOf<AppInfo>().apply { addAll(t) }
@@ -1131,6 +1299,9 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
                 .collect { reason ->
                     Logger.v(LOG_TAG_VPN, "RESTART; new restart request: $reason")
                     restartVpnWithNewAppConfig(reason)
+                    // the builder's routing decision may have changed, so the kernel
+                    // rule set has to be re-derived from it
+                    io("rootSyncAfterRestart") { syncRootFirewall(reason) }
                     io("eventLogger") {
                         eventLogger.logHigh(
                             EventType.VPN_RESTART,
@@ -1189,6 +1360,10 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
             // this should always be set before ConnectionMonitor is init-d
             // see restartVpn and updateTun which expect this to be the case
             persistentState.setVpnEnabled(true)
+
+            // choose the power profile (and start the blocking su probe) before the
+            // connectivity monitor schedules its first check
+            startRootRuntime()
 
             // periodic health-check that re-adds proxies missing from the tunnel
             GlobalProxyHandler.start(vpnScope)
@@ -1513,6 +1688,18 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
 
             PersistentState.LOCAL_BLOCK_LIST -> {
                 io("localBlocklistEnable") { setRDNS() }
+            }
+
+            PersistentState.ROOT_MODE_ENABLED -> {
+                io("rootModeChange") {
+                    if (persistentState.rootModeEnabled) {
+                        startRootRuntime()
+                    } else {
+                        // drop the kernel rules now rather than at service teardown
+                        PowerGovernor.select(root = false)
+                        stopRootRuntime()
+                    }
+                }
             }
 
             PersistentState.LOCAL_BLOCK_LIST_UPDATE -> {
@@ -1962,11 +2149,17 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
     fun signalStopService(reason: String, userInitiated: Boolean = true) {
         if (!userInitiated) notifyUserOnVpnFailure()
         io(reason) {
-            stopVpnAdapter()
-            eventLogger.logHigh(
-                EventType.VPN_STOP, "vpn service destroyed",
-                EventSource.SERVICE, userAction = userInitiated, details = "vpn destroyed"
-            )
+            // fire-and-forget teardown: a failure here (adapter already gone, event
+            // sink unavailable) must never escape to the default uncaught handler
+            try {
+                stopVpnAdapter()
+                eventLogger.logHigh(
+                    EventType.VPN_STOP, "vpn service destroyed",
+                    EventSource.SERVICE, userAction = userInitiated, details = "vpn destroyed"
+                )
+            } catch (e: Exception) {
+                Logger.w(LOG_TAG_VPN, "stop service cleanup failed: $reason, ${e.message}")
+            }
         }
         stopSelf()
         Logger.i(LOG_TAG_VPN, "stopped vpn adapter & service: $reason, $userInitiated")
@@ -3011,6 +3204,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
         }
         persistentState.setVpnEnabled(false)
         stopPauseTimer()
+        stopRootRuntime()
         // reset the underlying networks
         underlyingNetworks = null
         // reset the observer-tracked network set (observer is already stopped by now)

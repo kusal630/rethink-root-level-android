@@ -194,6 +194,8 @@ class TunnelSettingsActivity : BaseActivity(R.layout.activity_tunnel_settings) {
 
         b.settingsUseMaxMtuSwitch.isChecked = persistentState.useMaxMtu
 
+        b.settingsRootModeSwitch.isChecked = persistentState.rootModeEnabled
+
         if (isAtleastQ()) {
             b.settingsActivityTunnelMeteredRl.visibility = View.VISIBLE
             b.settingsActivityTunnelMeteredSwitch.isChecked = persistentState.setVpnBuilderToMetered
@@ -598,11 +600,22 @@ class TunnelSettingsActivity : BaseActivity(R.layout.activity_tunnel_settings) {
             )
         }
 
+        b.settingsRootModeRl.setOnClickListener {
+            b.settingsRootModeSwitch.isChecked = !b.settingsRootModeSwitch.isChecked
+        }
+
+        b.settingsRootModeSwitch.setOnCheckedChangeListener { _, isChecked ->
+            persistentState.rootModeEnabled = isChecked
+            logEvent(
+                "root mode",
+                "Root mode set to: $isChecked"
+            )
+        }
+
         b.settingsActivityTunnelMeteredRl.setOnClickListener {
             if (!isAtleastQ()) return@setOnClickListener
             b.settingsActivityTunnelMeteredSwitch.isChecked = !b.settingsActivityTunnelMeteredSwitch.isChecked
         }
-
         b.settingsActivityTunnelMeteredSwitch.setOnCheckedChangeListener { _, isChecked ->
             if (!isAtleastQ()) return@setOnCheckedChangeListener
             persistentState.setVpnBuilderToMetered = isChecked

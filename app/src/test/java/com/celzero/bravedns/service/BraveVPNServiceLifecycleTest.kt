@@ -63,6 +63,16 @@ class BraveVPNServiceLifecycleTest : KoinTest {
 
     @After
     fun tearDown() {
+        // Shut the service down *before* Koin goes away. Anything the service still has
+        // in flight (signalStopService's fire-and-forget cleanup, restart requests) would
+        // otherwise resolve its `by inject()` properties against a stopped Koin and throw
+        // on a background thread, where the exception escapes into whichever test runs
+        // next and shows up as UncaughtExceptionsBeforeTest.
+        try {
+            serviceController.destroy()
+        } catch (_: Exception) {
+            // already destroyed by the test itself
+        }
         stopKoin()
         unmockkObject(IpRulesManager)
         unmockkObject(VpnController)

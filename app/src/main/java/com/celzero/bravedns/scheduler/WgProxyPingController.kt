@@ -15,6 +15,7 @@
  */
 package com.celzero.bravedns.scheduler
 
+import com.celzero.bravedns.root.PowerGovernor
 import com.celzero.bravedns.util.Logger
 import com.celzero.bravedns.util.Logger.LOG_TAG_PROXY
 import com.celzero.bravedns.service.ProxyManager.ID_WG_BASE
@@ -33,7 +34,8 @@ import kotlin.time.Duration.Companion.milliseconds
 class WgProxyPingController(private val scope: CoroutineScope) {
     private val activeProxies = ConcurrentHashMap<String, PingConfig>()
 
-    private val intervalMs = 60_000L
+    private val intervalMs: Long
+        get() = PowerGovernor.current.proxyPingMs
     private val durationMs = 5 * 60 * 1000L
 
     @Volatile private var schedulerJob: Job? = null

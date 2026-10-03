@@ -23,6 +23,7 @@ import com.celzero.bravedns.database.RpnProxy
 import com.celzero.bravedns.database.RpnProxyRepository
 import com.celzero.bravedns.database.SubscriptionStatus
 import com.celzero.bravedns.database.SubscriptionStatusRepository
+import com.celzero.bravedns.data.AppConfig
 import com.celzero.bravedns.iab.BillingBackendClient
 import com.celzero.bravedns.iab.InAppBillingHandler
 import com.celzero.bravedns.iab.PurchaseDetail
@@ -77,6 +78,7 @@ class RpnProxyManagerTest : KoinTest {
     private val mockPersistentState: PersistentState = mockk(relaxed = true)
     private val mockBillingBackendClient: BillingBackendClient = mockk(relaxed = true)
     private val mockSubscriptionStatusDb: SubscriptionStatusRepository = mockk(relaxed = true)
+    private val mockAppConfig: AppConfig = mockk(relaxed = true)
     private lateinit var mockStateMachine: SubscriptionStateMachineV2
 
     private val stateFlow = MutableStateFlow<SubscriptionStateMachineV2.SubscriptionState>(SubscriptionStateMachineV2.SubscriptionState.Initial)
@@ -96,8 +98,14 @@ class RpnProxyManagerTest : KoinTest {
                 single { mockBillingBackendClient }
                 single { mockSubscriptionStatusDb }
                 single { mockStateMachine }
+                single { mockAppConfig }
             })
         }
+
+        // startProxy() flips the brave mode when it is not already DNS_FIREWALL; the
+        // mode change itself is asserted elsewhere, here it only has to be a no-op.
+        every { mockAppConfig.getBraveMode() } returns AppConfig.BraveMode.DNS
+        every { mockAppConfig.changeBraveMode(any()) } just Runs
 
         mockkObject(VpnController)
         mockkObject(InAppBillingHandler)
@@ -118,6 +126,7 @@ class RpnProxyManagerTest : KoinTest {
         setStaticFinalField(RpnProxyManager::class.java, "billingBackendClient\$delegate", lazyOf(mockBillingBackendClient))
         setStaticFinalField(RpnProxyManager::class.java, "subscriptionStatusRepository\$delegate", lazyOf(mockSubscriptionStatusDb))
         setStaticFinalField(RpnProxyManager::class.java, "subscriptionStateMachine\$delegate", lazyOf(mockStateMachine))
+        setStaticFinalField(RpnProxyManager::class.java, "appConfig\$delegate", lazyOf(mockAppConfig))
 
         // Safely clear cache
         try {

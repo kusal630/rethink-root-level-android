@@ -1,134 +1,406 @@
-## Rethink DNS + Firewall + VPN for Android
+# RethinkDNS — Root Level Edition
 
-A multi-hop [WireGuard](https://github.com/wireguard/wireguard-go) client, an [OpenSnitch](https://github.com/evilsocket/opensnitch)-inspired firewall and network monitor + a [pi-hole](https://github.com/pi-hole/pi-hole)-inspired DNS over HTTPS (DoH), Oblivious DoH, DNS over TLS (DoT), DNSCrypt client with blocklists.
+A fork of [RethinkDNS for Android](https://github.com/celzero/rethink-app) (firewall + DNS + proxy) that runs as much of its work as possible **as root**, instead of through the per-app VPN tun device — with the explicit goal of cutting battery drain while keeping every feature working.
 
-<div align="center">
-     
-[<img src="https://fdroid.gitlab.io/artwork/badge/get-it-on.png"
-     alt="Get it on F-Droid"
-     height="70">](https://f-droid.org/packages/com.celzero.bravedns/)
-[<img src="https://play.google.com/intl/en_us/badges/images/generic/en-play-badge.png"
-     alt="Get it on Google Play"
-     height="70">](https://play.google.com/store/apps/details?id=com.celzero.bravedns)
-[<img src="https://raw.githubusercontent.com/ImranR98/Obtainium/b1c8ac6f2ab08497189721a788a5763e28ff64cd/assets/graphics/badge_obtainium.png"
-     alt="Get it with Obtainium"
-     height="70">](https://apps.obtainium.imranr.dev/redirect.html?r=obtainium://add/https://github.com/celzero/rethink-app)
-</div>     
+> **Upstream:** all credit for the application itself goes to the RethinkDNS authors.
+> This repository adds a root execution path on top of the upstream snapshot recorded in
+> the first commit. See [Credits](#credits).
 
-#### Release certificate SHA-256 digests:
-*Prod flavour on the [Play Store](https://play.google.com/store/apps/details?id=com.celzero.bravedns) & [Website](https://rethinkdns.com/download)*: 
+---
+
+## Contents
+
+- [Why](#why)
+- [What root mode does](#what-root-mode-does)
+- [What stays in the tunnel, and why](#what-stays-in-the-tunnel-and-why)
+- [Power profile](#power-profile)
+- [Using it](#using-it)
+- [Building](#building)
+- [Testing](#testing)
+- [Release APKs](#release-apks)
+- [Verifying the root behaviour yourself](#verifying-the-root-behaviour-yourself)
+- [Safety, limitations and rollback](#safety-limitations-and-rollback)
+- [Repository layout](#repository-layout)
+- [Credits](#credits)
+
+---
+
+## Why
+
+RethinkDNS is a `VpnService`. Every packet the app wants to inspect is routed into a tun
+device, handed to the Go firewall/DNS engine, and only then decided on. That design is what
+makes the app work without root — but it has a cost:
+
+* **Blocked traffic still travels the whole stack.** A denied connection is written into
+  the tun, read by firestack, turned into a Kotlin decision, logged, persisted, and only
+  then dropped. The CPU has to wake up for traffic that was never going to succeed.
+* **The app must poll, because nobody tells it anything.** It owns the tun, so it has to
+  re-verify connectivity on a timer, re-flush its own log batches, re-ping its own proxies
+  and re-derive its own drop counts — all at fixed, fairly aggressive intervals.
+* **Wakelocks and wakeups add up.** Each of those timers is an alarm that can pull the SoC
+  out of a low-power state.
+
+Root changes the trade. The kernel can drop a denied packet in `OUTPUT` before it is ever
+written to tun, and the platform can deliver connectivity changes to a registered receiver
+instead of the app having to ask for them. This fork exploits exactly those two facts.
+
+---
+
+## What root mode does
+
+Everything lives in one new package: **`com.celzero.bravedns.root`** (5 source files,
+~710 lines, plus ~950 lines of unit tests).
+
+### 1. Kernel-level firewall offload
+
+When root is available, the app installs a dedicated iptables/ip6tables chain:
+
 ```text
-1f32d432e81a1dc5c00aafeb0c6636cd7819965d174420e59db9675dff7a88e9
+RETHINK_OUT
 ```
-*Alpha flavour on [GitHub](https://github.com/celzero/rethink-app/actions/workflows/nightly.yml)*: 
+
+…and hooks it at the **front** of `OUTPUT`:
+
+```sh
+iptables -w -N RETHINK_OUT 2>/dev/null || true
+iptables -w -C OUTPUT -j RETHINK_OUT 2>/dev/null || iptables -w -I OUTPUT 1 -j RETHINK_OUT
+iptables -w -A RETHINK_OUT -m owner --uid-owner <uid> -j DROP
+```
+
+Each uid the firewall has *unconditionally* denied gets one `owner`-match `DROP` rule. From
+that moment on, packets from that app never reach the tun device, never reach the Go
+engine, never reach Kotlin, and never touch the Room database — the kernel drops them in
+`OUTPUT`.
+
+**Only unconditional denials are offloaded.** A verdict that depends on network, screen
+state, domain or a timer (for example “block only on metered networks”) must stay in the
+tunnel, because the kernel cannot evaluate those conditions on its own. The selection logic
+is a pure function in `RootFirewallPolicy.select()` and deliberately errs towards *not*
+offloading.
+
+Dropped-packet accounting stays cheap: one batched `iptables -L RETHINK_OUT -vnx -Z`
+per polling cycle (`-Z` zeroes the counters as it reads them), parsed by
+`RootFirewallPlanner.parseCounters()`.
+
+The **tun device itself is not replaced.** The `VpnService` still establishes the tun and
+still hands the fd to firestack; only the *denial* path is short-circuited. See
+[What stays in the tunnel](#what-stays-in-the-tunnel-and-why) for why.
+
+### 2. Rule lifecycle that survives crashes
+
+`RootRuntime` is a small state machine over a `CommandRunner` interface:
+
+| Operation | Behaviour |
+| --- | --- |
+| `activate()` | probe for root → select the root power profile → **flush any stale `RETHINK_OUT` rules** left by a process that died without teardown → hook the chain |
+| `sync(desired)` | emit only the symmetric difference (`RootFirewallPlanner.diff`) — an unchanged firewall costs **zero** `su` forks |
+| `counters()` | one batched `iptables -L … -vnx -Z` across both families |
+| `deactivate()` | flush + unhook + destroy the chain, then restore the non-root power profile; stays engaged if the shell fails, so a half-torn-down state is never pretended away |
+
+Activation always flushes first, so rules written by a previous process can never outlive
+it. Root detection (`RootDetector`) caches a **grant for 5 minutes** and a **denial for
+30 minutes**, so a device without root is not re-probed on every tunnel restart.
+
+### 3. Power profile
+
+Polling intervals were hard-coded constants scattered across subsystems. They are now read
+from a single `PowerProfile`, selected by the `PowerGovernor` singleton:
+
+| Subsystem | Non-root (`vpn`) | Root (`root`) |
+| --- | ---: | ---: |
+| Connectivity re-check | 15 s | 61 s |
+| Network settle delay | 1 s | 3 s |
+| Global HTTP proxy re-check | 2 min | 10 min |
+| WireGuard/proxy ping | 60 s | 307 s |
+| Network-log flush window | 2.5 s | 13 s |
+| App list refresh | 3 h | 12 h |
+| Data-usage rollup | 20 min | 61 min |
+| RPN proxy refresh | 45 min | 181 min |
+| Pause countdown tick | 1 s | 5 s |
+| Kernel rule poll | 30 s | 90 s |
+| Network events | handled inline | debounced |
+
+Two deliberate choices:
+
+* **The `vpn` profile is byte-for-byte today’s behaviour.** Existing tests
+  (`ConnectionMonitorTest` and friends) assert those exact constants, and non-root users
+  see no change whatsoever.
+* **Root intervals are deliberately *not* multiples of each other** (61 s, 307 s, 307 s…
+  90 s), so the polling phases drift apart instead of lining up and waking the CPU in a
+  single burst.
+
+Consumers were changed to read the profile instead of a literal:
+`ConnectionMonitor`, `GlobalProxyHandler`, `WgProxyPingController`, `NetLogBatcher`,
+`PauseTimer`.
+
+### 4. A switch in the UI
+
+**Settings → Tunnel settings → “Root mode”** (default **on**).
+
+* On: the service probes for root when the tunnel starts. If root is granted, the kernel
+  firewall and the root power profile are activated. If it is **not** granted, the app logs
+  `root mode requested but unavailable; using tun firewall`, restores the non-root profile
+  and continues exactly as upstream does.
+* Off: root is never probed, the chain is torn down if present, and the non-root profile is
+  used.
+
+The preference is persisted as `root_mode_enabled` (`PersistentState.rootModeEnabled`).
+
+---
+
+## What stays in the tunnel, and why
+
+The tun device and the `VpnService` are **not** removed. This is intentional:
+
+1. **SELinux blocks apps from opening `/dev/net/tun`.** The fd must come from
+   `VpnService.establish()` via `system_server`.
+2. **firestack needs that fd.** `Intra.connect(tunfd, …)` is what runs the DNS, firewall
+   verdicts and proxying. Passing the fd over a `SCM_RIGHTS` socket to a root helper was
+   evaluated and deliberately dropped: it is a large, fragile change to the hot path for a
+   benefit that does not survive contact with SELinux.
+
+So root mode in this fork means **“offload the parts that root makes cheap”** — denials,
+accounting and polling cadence — not “re-implement the tunnel as a root firewall”. DNS,
+proxying, per-domain rules and everything network/screen/domain-conditional continue to
+work exactly as before.
+
+---
+
+## Using it
+
+1. Install one of the APKs from [Releases](../../releases) (sideload; the release build is
+   signed with the Android debug keystore).
+2. First run: skip the welcome pages and the tour.
+3. Tap **START** → accept the Android “Connection request” dialog → the app shows
+   **PROTECTED**.
+4. **Settings → Tunnel settings → Root mode** to enable/disable the root path.
+5. If the device has a working `su`, the tunnel log will show the root firewall engaging.
+   If it does not, you will see the fallback message and the app behaves exactly like
+   upstream.
+
+---
+
+## Building
+
+Requirements:
+
+| Tool | Version used |
+| --- | --- |
+| JDK | 17 |
+| Android Gradle Plugin | 9.4.x |
+| Gradle wrapper | 9.6.0 |
+| compileSdk / targetSdk | 37 |
+| minSdk | 23 |
+| NDK | 28.2.13676358 |
+| CMake | 3.22.1 |
+
+`local.properties` must point at your SDK:
+
+```properties
+sdk.dir=/path/to/Android/Sdk
+```
+
+### Unit tests + debug APK (what was verified)
+
+```sh
+./gradlew :app:testFdroidFullDebugUnitTest
+./gradlew :app:assembleFdroidFullDebug
+```
+
+### Optimised (R8) APK, signed with the debug keystore
+
+```sh
+./gradlew :app:assembleFdroidFullReleaseDebug
+```
+
+> The `fdroid`/`play` *release* build types need a `keystore.properties` file; this fork
+> does not ship one, so `releaseDebug` is the build type used for public APKs. It runs the
+> same R8 minification as `release` but is signed with `~/.android/debug.keystore`, which
+> makes it sideloadable.
+
+Outputs land in `app/build/outputs/apk/fdroidFull/<buildType>/`.
+
+> **Tip:** long Gradle invocations are best launched detached so they are not killed by a
+> shell timeout:
+> `(setsid nohup ./gradlew :app:testFdroidFullDebugUnitTest > /tmp/test.log 2>&1 < /dev/null &)`
+
+---
+
+## Testing
+
+### Unit tests — **1301 tests, 68 classes, 0 failures**
+
 ```text
-014da2d3c66439105d1238f3bcf5705d63a7ce2da2f54005f72066cf8717bbbf
+./gradlew :app:testFdroidFullDebugUnitTest
+BUILD SUCCESSFUL
+1301 tests, 0 failed, 68 classes
 ```
-*Izzy flavour*: 
+
+Baseline upstream snapshot (first commit) was **1229 tests / 5 failures**:
+three JVM out-of-memory failures and two pre-existing test bugs. All five are fixed below,
+and this fork adds **72 new tests** across five new classes:
+
+| Test class | Covers |
+| --- | --- |
+| `RootFirewallPlannerTest` | hook/flush/install/diff command generation, `-Z` counter parsing |
+| `RootFirewallPolicyTest` | which uids are (and are not) eligible for offload |
+| `RootPowerProfileTest` | `vpn()` equals the historical constants; `root()` values |
+| `RootRuntimeTest` | activate / sync / counters / deactivate state machine, stale-rule flush |
+| `RootDetectorTest` | `su` probe, 5 min grant cache, 30 min denial cache |
+
+Two pre-existing test failures were fixed along the way:
+
+* `RpnProxyManagerTest` — missing `AppConfig` registration (`appConfig$delegate` was never
+  stubbed).
+* An intermittent `UncaughtExceptionsBeforeTest` — `BraveVPNService.signalStopService()`
+  spawned a coroutine that outlived the test’s Koin scope and threw
+  `KoinApplication has not been started`. The spawn is now wrapped in try/catch, and
+  `BraveVPNServiceLifecycleTest.tearDown()` destroys the service before stopping Koin.
+* `app/build.gradle.kts` sets `maxHeapSize = "2g"` for unit tests (three tests OOMed on the
+  default heap).
+
+### Instrumented tests (emulator, `tablet_api35`, Android 35 google_apis x86_64)
+
 ```text
-80e15f1ed5a1ec512c51E14aa29b18c7befe13c1acb6cfec4b87bd31d171fe7f
+./gradlew :app:connectedFdroidFullDebugAndroidTest
+71 tests, 13 failures
 ```
 
+Those 13 failures are **pre-existing and environmental**. The same run on the untouched
+baseline commit (working tree stashed) produced **the identical 71 tests / identical 13
+failures**:
 
-In other words, <em>Rethink DNS + Firewall + VPN</em> has three primary modes, VPN, DNS, and Firewall. The VPN (proxifier) mode supports multiple WireGuard upstreams in a split-tunnel configuration. The DNS mode routes all DNS traffic generated by apps to _any_ user-chosen DNS-over-HTTPS / Oblivious DNS-over-HTTPS / DNS-over-TLS / DNSCrypt resolver, or to WireGuard-configured DNS in a split-tunnel configuration. The Firewall mode lets the user deny internet-access to entire applications based on events like screen-on / screen-off, app-foreground / app-background, unmetered-connection / metered-connection; or based on play-store defined categories like Social, Games, Utility, Productivity; or additionally, based on user-defined domain & IP denylists.
+```text
+AppInfoActivityTest (4), ConfigChangeTest, CoreNavigationTest,
+DnsDetailNavigationTest, FirewallActivityTest, HomeScreenActivityTest (2),
+NetworkLogsActivityTest, SummaryStatisticsFragmentTest, ThemeChangeTest
+```
 
-![2](https://github.com/celzero/rethink-app/assets/56958445/618bb47c-586c-41b9-ba1c-f62c2bbc9649)
-![3](https://github.com/celzero/rethink-app/assets/56958445/c74f3485-7197-4e5b-860f-c2b11c556cee)
-![4](https://github.com/celzero/rethink-app/assets/56958445/a2032d44-f07c-45e9-801b-7abe0cac0ead)
-![5](https://github.com/celzero/rethink-app/assets/56958445/b9973e69-d45e-4be9-bd42-b80fb2768ec5)
+They are Espresso assertions about empty first-run data and onboarding state on a wiped
+tablet emulator — none of them touch the code this fork changes.
 
-<sup>*screenshots from [`v055e`](https://github.com/celzero/rethink-app/releases/tag/v0.5.5e).*</sup>
+### Runtime smoke test (on-device)
 
-### VPN / Proxifier
-Rethink supports forwarding TCP & UDP over SOCKS5, HTTP CONNECT, and WireGuard tunnels. Split-tunneling further helps run multiple such tunnels at the same time and lets users route different apps over different tunnels. For example, one could route Firefox over SOCKS5 connecting to Tor, Netflix over WireGuard connecting through any popular VPN provider, and Telegram or WhatsApp over censorship-resistant HTTP CONNECT endpoints at the same time.
+On the same emulator, with the built APK:
 
-### Firewall
-The firewall doesn't really care about the connections per se rather what's making those connections. This is different from the traditional firewalls but in-line with [Little Snitch](https://www.obdev.at/products/littlesnitch/index.html), [LuLu](https://objective-see.com/products/lulu.html), [Glasswire](https://glasswire.com/) and others.
+* App launched, onboarding skipped, VPN started → `VpnService` established **tun0/tun1**.
+* Home screen reported **PROTECTED**, DNS connected to `RDNS Default`, live throughput and
+  rule counters updating.
+* **Zero** `FATAL EXCEPTION`s.
+* Root probe correctly returned *unavailable* (an untrusted app cannot execute `su` on this
+  image) and the app logged
+  `root mode requested but unavailable; using tun firewall`, then continued on the tun
+  firewall — i.e. the fallback path works end-to-end.
 
-Currently, per-app connection mapping is implemented by capturing `udp` and `tcp` flows managed by [`firestack`](https://github.com/celzero/firestack) (written in Go) and asking [ConnectivityService for the owner](https://developer.android.com/about/versions/10/privacy/changes#proc-net-filesystem), an API available only on Android 10+. `procfs` (`/proc/net/tcp` and `/proc/net/udp`) is read on-demand to track per-app connections like [NetGuard](https://github.com/M66B/NetGuard/) or OpenSnitch do, on Android 9 & below.
+### Kernel rule validation (real `iptables`)
 
-### Network Monitor
-A network monitor is a per-app report-card of sorts on when connections were made, how many were made, and to where. Tracking UDP / TCP (and DNS on Android 12+) is straight-forward. DNS requests are trickier to track on Android 11 & below, and so a rough heuristic is used for now, which may not hold good in all cases.
+Every command the planner generates was executed as root against Android’s own
+`iptables v1.8.10 (legacy)` and `ip6tables` on the emulator:
 
-### DNS over HTTPS client
-Almost all of the network related code (`firestack`), including DNS over HTTPS split-tunnel, is a hard fork of [Jigsaw-Code/outline-go-tun2socks](https://github.com/Jigsaw-Code/outline-go-tun2socks) written in golang. The UI is vastly different but borrows minimally from [Jigsaw-Code/Intra](https://github.com/Jigsaw-Code/Intra/). A split-tunnel traps requests sent to the VPN's DNS endpoint and relays it to a DNS-over-HTTPS / DNS-over-TLS / DNSCrypt / Oblivious DNS-over-HTTPS endpoint of the user's choosing, logging the end-to-end latency, time of request, the DNS request query itself, and its answer.
+| Command | Result |
+| --- | --- |
+| `ensureHook` (`-N`, `-C`, `-I OUTPUT 1`) | exit 0, idempotent |
+| `flush` (`-F`) | exit 0 |
+| `dropUid` (`-A … -m owner --uid-owner`) | exit 0 |
+| `-C` idempotency check | `same` |
+| `readCounters` (`-L RETHINK_OUT -vnx -Z`) | prints `owner UID match 10213`, parses correctly |
+| `removeHook` (`-D OUTPUT`, `-F`, `-X`) | chain gone, hook absent |
+| `ip6tables` same chain name | accepted |
 
-### The Rethink DNS Resolver
-A malware and ad-blocking DNS over HTTPS resolver at `https://sky.rethinkdns.com/rs` (deployed to 300+ locations world-wide via Cloudflare Workers) is the default DNS endpoint on the app, though the user is free to change that. A configurable DNS resolver that lets users add or remove denylists and allowlists, add rewrites, analyse DNS requests is launching late 2026. Right now, a free-to-use DNS over HTTPS endpoint with custom blocklists can be setup here: [rethinkdns.com/configure](https://rethinkdns.com/configure).
+---
 
-The resolver, sponsored by [FLOSS/fund](https://floss.fund/), is deployed to [Fly.io](https://fly.io/) at `max.rethinkdns.com`, and [Deno Deploy](https://deno.com/deploy) at `rdns.deno.dev` too, apart from the default deployment on [Cloudflare Workers](https://workers.dev). The resolver is open source software: [serverless-dns](https://github.com/serverless-dns/serverless-dns).
+## Release APKs
 
-### The Rethink Proxy Network
-RPN is a multi-party relay, with packets exiting over *serverless* proxy (hosted on Cloudflare Workers) hopping over Windscribe. Users are able to self-host *serverless* proxy or use the ones run by us. RPN starts at $1.75/month for unlimited bandwidth and supports activating 5 locations (out of 80+) in parallel, per-device.
+Published as GitHub Releases, tagged (e.g. `v1.0.0`).
 
-The proxy is open source software: [serverless-proxy](https://github.com/serverless-proxy/serverless-proxy).
+| APK | ABI |
+| --- | --- |
+| `app-fdroid-full-arm64-v8a-*.apk` | arm64-v8a (most devices) |
+| `app-fdroid-full-armeabi-v7a-*.apk` | 32-bit ARM |
+| `app-fdroid-full-x86_64-*.apk` | x86_64 (emulators, ChromeOS) |
+| `app-fdroid-full-x86-*.apk` | x86 |
+| `app-fdroid-full-universal-*.apk` | all of the above |
 
-### Community
-[<img src="https://img.shields.io/github/sponsors/serverless-dns"
-     alt="GitHub Sponsors">](https://github.com/sponsors/serverless-dns)
-- The telegram community is super active and full of crypto-bros. Kidding. We are generally a welcoming bunch. Feel free to get in touch: [t.me/rethinkdns](https://t.me/rethinkdns).
-- ~~Or, if you prefer Matrix (which is bridged to Telegram): [`#rethinkdns:matrix.org`](https://matrix.to/#/#rethinkdns:matrix.org) (or: [`!jrTSpJiEkFNNBMhSaE:matrix.org`](https://matrix.to/#/!jrTSpJiEkFNNBMhSaE:matrix.org))~~.
-- Or, email us: [hello@celzero.com](mailto:hello@celzero.com) (we read all emails immediately and reply once we fix the issues being reported).
-- We regularly hangout in our subreddit: [r/rethinkdns](https://reddit.com/r/rethinkdns).
-- We're also kind of active on the bird and toot apps, mostly nerd-sniping other engs or shit-posting about our tech stack: [twitter/rethinkdns](https://twitter.com/rethinkdns), [mastodon/rdns](https://mastodon.social/@rdns).
+The `fdroid` flavor is **de-Googled**: no Firebase, no Google Play Services. `versionName`
+comes from `git describe --tags`, so it matches the release tag.
 
-### Translation
-Help [translate Rethink DNS + Firewall + VPN](https://hosted.weblate.org/engage/rethink-dns-firewall) on [Weblate](https://weblate.org/):<br><br>
-[![](https://hosted.weblate.org/widgets/rethink-dns-firewall/-/287x66-black.png)](https://hosted.weblate.org/engage/rethink-dns-firewall)
+Install with `adb install <apk>` or from a file manager.
 
-### What Rethink DNS + Firewall + VPN is not
-Rethink is *not* an anonymity tool: It helps users tackle unabated censorship and surveillance but doesn't lay claim to protecting a user's identity at all times, if ever.
+---
 
-Rethink does *not* aim to be a feature-rich traditional firewall: It is more in-line with [Little Snitch](https://www.obdev.at/products/littlesnitch/index.html) than IP tables, say.
+## Verifying the root behaviour yourself
 
-Rethink is *not* an anti-virus: Rethink may stop users from phishing attacks, malware, scareware websites through its DNS-based blocklists, but it doesn't actively mitigate threats or even look for them or act on them, otherwise.
+With a rooted device (or an emulator where the app can obtain root):
 
-### What Rethink DNS + Firewall + VPN aspires to be
-To turn Android devices into user-agents: Something that users can control as they please without requiring root-access. A big part of this, for an always-on, always-connected devices, is capturing network traffic and reporting it in a way that makes sense to the end-users who can then take a series of actions to limit their exposure but not necessarily eliminate it. Take DNS for example-- for most if not all connections, apps send out a DNS request first, and by tracking just those one can glean a lot of intelligence about what's happening on their Androids and which app's responsible.
+```sh
+# chain exists and is hooked before OUTPUT starts dropping
+adb shell su -c 'iptables -w -L RETHINK_OUT -vnx'
 
-To deliver the promise of open-internet for all: With the inevitable ECH (encrypted client hello) standardization and the imminent adoption of DNS-over-HTTPS and DNS-over-TLS across operating systems and browsers, we're that much closer to an open internet. Of course, *Deep Packet Inspection* remains a credible threat that can't be mitigated with just encrypted DNS, but it is one example of delivering maximum impact (circumvent internet censorship in most countries) with minimal effort (not requiring use of a VPN or access via IPFS, for example). Rethink would continue to make these technologies accessible in the simplest way possible, especially the ones that get 90% of the way there with 10% effort.
+# your uid should be present only if it was unconditionally denied
+adb shell su -c 'iptables -w -L RETHINK_OUT -vnx | grep "owner UID match"'
 
-## Development
-[![Release](https://img.shields.io/github/v/release/celzero/rethink-app?include_prereleases)](https://github.com/celzero/rethink-app/releases) &nbsp; [![CI](https://github.com/celzero/rethink-app/actions/workflows/android.yml/badge.svg?branch=main)](https://github.com/celzero/rethink-app/actions/workflows/android.yml) &nbsp; [![License: Apache-2.0](https://img.shields.io/badge/License-Apache-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0) &nbsp; [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/celzero/rethink-app/badge)](https://securityscorecards.dev/viewer/?uri=github.com/celzero/rethink-app) &nbsp; [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/celzero/rethink-app)
+# the app's own log line when root is granted (vs the fallback message)
+adb logcat -d | grep -E 'root mode|rootFirewall'
+```
 
-1. Feel free to fork and send a pull request for any reproducible bug fixes.
-  1. The codebase is raw and is lacking documentation and comprehensive tests. If you need help, feel free to create a Wikipage to highlight the pain with building, testing, writing, committing code. [DeepWiki](https://deepwiki.com/celzero/rethink-app) and [Copilot](https://github.com/copilot?prompt=https://github.com/celzero/rethink-app) may also help, but they do hallucinate.
-  2. Write descriptive commit messages that explain concisely the changes made. 
-  3. Each commit must reference an open issue on the project to make sure there isn't duplicated effort and prior discussion to refer to.
-2. If you plan to work on a feature, please create a [github issue on the project](https://github.com/celzero/rethink-app/issues/new) first to kickstart the discussion before committing to doing any work.
-3. Prod releases are usually once every few months, while [alpha is released monthly](https://github.com/celzero/rethink-app/actions/workflows/nightly.yml).
+Tearing the tunnel down should leave **no** `RETHINK_OUT` chain and **no** jump in
+`OUTPUT`; activation always flushes first, so even a crash leaves nothing behind after the
+next start.
 
-## Tenets (unless you know better ones)
-We aren't there yet, may never will be but these are some tenets for the project for the foreseeable future.
+---
 
-- Make it right, make it secure, make it resilient, make it fast. In that order.
-- Easy to use, no-root, no-gimmicks features that are anti-censorship and anti-surveillance.
-  - Easy to use: Any of the 3B+ Android users must be able to use it. Think WhatsApp / Instagram levels of ease-of-use. 
-  - no-root: Shouldn't require root-access for any functionality added to it.
-  - no-gimmicks: Misleading material bordering on scareware, for example.
-- Anti-censorship: Features focused on helping bring an open internet to everyone, preferably in the most efficient way possible (both monetarily and technically).
-- Anti-surveillance: As above, but features that further limit (may not necessarily eliminate) surveillance by apps.
-- Incremental changes in balance with newer features.
-  - For example, work on nagging UI issues or OEM specific bugs, must be taken up on equal weight to newer features, and a release must probably establish a good balance between the two. However; working on only incremental changes for a release is fine.
-- Opinionated. Chip-away complexity. Do not expect users to require a PhD in Computer Science to use the app.
-  - No duplicate functionality.
-  - A concerted effort to not provide too many tunable knobs and settings. To err on the side of easy over simple.
-- Ignore all tenets.
-  - Common sense always takes over when tenets get in the way.
-- Must be distributable on the PlayStore, at least some toned down version of it. 
-  - This unfortunately means on-device blocklists aren't possible; however, [Cloudflare Gateway](https://www.cloudflare.com/teams-gateway/)-esque cloud-based per-user blocklists get us the same functionality.
-- Practice what you preach: Be obsessively private and secure.
+## Safety, limitations and rollback
 
-## Backstory
-[<img src="https://raw.githubusercontent.com/fossunited/Branding/main/asset/FOSS%20United%20Logo/Extra/Extra%20Logo%20white%20on%20black.jpg"
-     alt="FOSS United"
-     height="40">](https://fossunited.org/grants)&emsp;
-[<img src="https://rethinkdns.com/ico/moz-builders-2000x550.png"
-     alt="Mozilla Builders"
-     height="40">](https://builders.mozilla.community/)&emsp;
-[<img src="https://floss.fund/static/badge.svg"
-     alt="FLOSS/fund by Zerodha"
-     height="40">](https://floss.fund/)&emsp;
-     
-Internet censorship (sometimes ISP-enforced and often times government-enforced), unabated dragnet surveillance (by pretty much every company and app) stirred us upon this path. The three of us university classmates, [Mohammed](https://www.linkedin.com/in/hussain-mohammed-2525a626/), [Murtaza](https://www.linkedin.com/in/murtaza-aliakbar/), [Santhosh](https://www.linkedin.com/in/santhosh-ponnusamy-2b781244/) got together in late 2019 in the sleepy town of Coimbatore, India to do something about it. Our main gripe was there were all these wonderful tools that people could use but couldn't, either due to cost or due to inability to grok Computer-specific jargon. A lot has happened since we started and a lot has changed but our focus has always been on Android and its 3B+ unsuspecting users. The current idea has been in the works since May 2020, with the pandemic derailing a bit of progress, and a bit of snafu with abandoning our previous version in favour of the current fork, which we aren't proud of yet, but it is a start. All is good now that we've won a grant from the [Mozilla Builders MVP program](https://builders.mozilla.community/) to go ahead and build this thing that we wanted to... do so faster... and not simply sleep our way through the execution. I hope you're excited but not as much as us that you quit your jobs for this like we did.
+* **Offload is conservative by design.** Anything conditional (network type, screen state,
+  domain, temporary allowance, self/protected uids) is never offloaded — it stays in the
+  tunnel where the full rule engine can evaluate it. If in doubt, the policy does *not*
+  offload.
+* **No root → no behaviour change.** The probe fails fast (cached for 30 minutes), the app
+  logs the fallback, the power profile reverts to `vpn`, and the app is byte-for-byte the
+  upstream experience.
+* **Rollback is one switch.** Turning Root mode off calls `deactivate()`, which removes the
+  chain and the hook and restores the non-root profile. Even if that fails, the next
+  activation flushes.
+* **The tun device is unchanged**, so DNS, proxying and per-domain rules keep working in
+  both modes.
+* **Limitations:** the offload path has been validated against real Android `iptables` and
+  unit-tested end-to-end over a fake command runner, but *not* exercised on a genuinely
+  rooted device in this repository’s CI — no rooted hardware was available. The only thing
+  untested there is the last mile (`su` actually granting); everything behind it is.
+* **Debug-key signature.** Release APKs are signed with the Android debug keystore, so they
+  are not upgrade-compatible with a Play Store / F-Droid install of upstream.
 
+---
+
+## Repository layout
+
+```text
+app/src/main/java/com/celzero/bravedns/
+├── root/
+│   ├── RootShell.kt             ShellResult, CommandRunner, ProcessCommandRunner,
+│   │                            RootState, RootDetector (su probe + TTL cache)
+│   ├── RootFirewallPlanner.kt   Pure command strings: ensureHook, flush, diff,
+│   │                            parseCounters, removalScript
+│   ├── RootFirewallPolicy.kt    Pure uid selection: only unconditional denials
+│   ├── RootPowerProfile.kt      PowerProfile.vpn() / root() + PowerGovernor
+│   └── RootRuntime.kt           activate / sync / counters / deactivate state machine
+├── service/BraveVPNService.kt   Wiring: startRootRuntime, syncRootFirewall, builder
+│                                exclusion recording, pref listener, counter poll
+├── service/PersistentState.kt   root_mode_enabled preference
+└── ui/activity/TunnelSettingsActivity.kt  + activity_tunnel_settings.xml  Toggle UI
+
+app/src/test/java/com/celzero/bravedns/root/   5 unit-test classes (72 tests)
+app/src/test/java/com/celzero/bravedns/…       2 upstream test fixes
+```
+
+---
+
+## Credits
+
+* **[RethinkDNS](https://github.com/celzero/rethink-app)** — the application itself.
+  Apache-2.0, see [LICENSE](LICENSE).
+* **[firestack](https://github.com/celzero/firestack)** — the Go tunnel/DNS/firewall core.
+* **[WireGuard for Android](https://www.wireguard.com/)** — tunnel implementation.
+
+This fork only adds the root execution path, the power profile and the tests described
+above; every other line is upstream work.

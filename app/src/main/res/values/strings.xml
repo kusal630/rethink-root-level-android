@@ -2196,6 +2196,9 @@
     <string name="settings_jumbo_packets" translatable="true">Bandwidth booster</string>
     <string name="settings_jumbo_packets_desc" translatable="true">Uses <i>jumbo packets</i> within Rethink\'s VPN tunnel.</string>
 
+    <string name="settings_root_mode" translatable="true">Root mode</string>
+    <string name="settings_root_mode_desc" translatable="true">Enforce per-app rules in the kernel when a superuser grant is available. Blocked traffic is dropped before it reaches the tunnel, which saves battery. Falls back to the tunnel if root is unavailable.</string>
+
     <string name="settings_tunnel_metered" translatable="true">Always metered</string>
     <string name="settings_tunnel_metered_desc" translatable="true">Mark Rethink\'s VPN tunnel as metered to encourage apps to use less data. Caution: This may cause apps to pause large uploads &amp; downloads, like backups.</string>
 

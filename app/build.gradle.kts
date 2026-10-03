@@ -367,6 +367,14 @@ android {
             )
         )
     }
+    testOptions {
+        unitTests {
+            // gradle's default test-jvm heap (512m) is too small for the
+            // robolectric-based suites here (three of them OOM'd on the
+            // default), so give every unit-test jvm a 2g heap.
+            all { it.maxHeapSize = "2g" }
+        }
+    }
 
     if (hasTvReleaseSigningConfig) {
         val tvRelease = signingConfigs.create("tvRelease") {
