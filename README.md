@@ -141,13 +141,36 @@ per polling cycle (`-Z` zeroes the counters as it reads them), parsed by
 | Operation | Behaviour |
 | --- | --- |
 | `activate()` | probe for root → select the root power profile → **flush any stale `RETHINK_OUT` rules** left by a process that died without teardown → hook the chain |
-| `sync(desired)` | emit only the symmetric difference (`RootFirewallPlanner.diff`) — an unchanged firewall costs **zero** `su` forks |
+| `sync(desired)` | emit only the symmetric difference (`RootFirewallPlanner.diff`) — an unchanged firewall costs **zero** root commands |
 | `counters()` | one batched `iptables -L … -vnx -Z` across both families |
 | `deactivate()` | flush + unhook + destroy the chain, then restore the non-root power profile; stays engaged if the shell fails, so a half-torn-down state is never pretended away |
 
 Activation always flushes first, so rules written by a previous process can never outlive
 it. Root detection (`RootDetector`) caches a **grant for 5 minutes** and a **denial for
 30 minutes**, so a device without root is not re-probed on every tunnel restart.
+
+#### One `su` per process, not one per command
+
+`ProcessCommandRunner` opens a **single long-lived root shell** (`ShellSession`) and writes
+every root command to its stdin, terminated by a marker line that carries the exit code.
+Until now each command forked its own `su`, so a counters poll (every 90 s), a firewall
+sync and a tun re-establish each re-issued a superuser request — on a rooted device that is
+exactly what the superuser app repeats as *"Rethink is given root level permissions"*, over
+and over.
+
+* The shell is opened lazily and reused; `su` forks again only if it dies (idle timeout,
+  revoked grant, killed by the superuser app), and the command is retried once on the
+  replacement shell.
+* A command that times out **kills the shell** rather than holding the root lock forever,
+  and a daemon thread drains stdout continuously, so `iptables -L -vnx` over a large rule
+  set can neither fill a pipe nor wedge the session.
+* **This is an optimisation, not a requirement.** Not every `su` hands a shell its stdin —
+  the AOSP-style `su` on some emulators and ROMs runs each command with stdin on
+  `/dev/null`. The first session attempt proves the shell answers a no-op with exit 0; if
+  it does not, the runner records the device as one-fork-per-command and uses the original
+  path (`su -c '<command>'` / `su <who> sh -c '<command>'`, dialect probed once and cached
+  on a hit) for the rest of the process. Nothing about the root path changed for those
+  devices beyond one extra failed attempt at startup.
 
 ### 4. Power profile
 
@@ -299,17 +322,17 @@ above produces byte-identical binaries to the ones checked in.
 
 ## Testing
 
-### Unit tests — **1319 tests, 69 classes, 0 failures**
+### Unit tests — **1334 tests, 71 classes, 0 failures**
 
 ```text
 ./gradlew :app:testFdroidFullDebugUnitTest
 BUILD SUCCESSFUL
-1319 tests, 0 failed, 69 classes
+1334 tests, 0 failed, 71 classes
 ```
 
 Baseline upstream snapshot (first commit) was **1229 tests / 68 classes, 5 failures**:
 three JVM out-of-memory failures and two pre-existing test bugs. All five are fixed below,
-and this fork adds **90 new tests** across six new classes:
+and this fork adds **105 new tests** across eight new classes:
 
 | Test class | Tests | Covers |
 | --- | ---: | --- |
@@ -319,6 +342,8 @@ and this fork adds **90 new tests** across six new classes:
 | `RootPowerProfileTest` | 9 | `vpn()` equals the historical constants; `root()` values |
 | `RootRuntimeTest` | 20 | activate / sync / counters / deactivate state machine, stale-rule flush |
 | `RootDetectorTest` | 10 | `su` probe, 5 min grant cache, 30 min denial cache |
+| `ShellSessionTest` | 9 | the shared root shell: marker/exit-code protocol, stderr, no-trailing-newline output, output past the pipe buffer, timeout kills the shell |
+| `ProcessCommandRunnerTest` | 6 | the dispatcher: one `su` fork for every root command in a session, one fork per command when `su` refuses stdin, both `su` dialects, missing/failing `su` reported as denied |
 
 Pre-existing test failures were fixed along the way:
 
