@@ -12,8 +12,12 @@ A fork of [RethinkDNS for Android](https://github.com/celzero/rethink-app) (fire
 
 - [Why](#why)
 - [What root mode does](#what-root-mode-does)
-- [What stays in the tunnel, and why](#what-stays-in-the-tunnel-and-why)
-- [Power profile](#power-profile)
+  - [1. A tun device the app owns — no VPN](#1-a-tun-device-the-app-owns--no-vpn)
+  - [2. Kernel-level firewall offload](#2-kernel-level-firewall-offload)
+  - [3. Rule lifecycle that survives crashes](#3-rule-lifecycle-that-survives-crashes)
+  - [4. Power profile](#4-power-profile)
+  - [5. A switch in the UI](#5-a-switch-in-the-ui)
+- [What still runs in the Go engine](#what-still-runs-in-the-go-engine)
 - [Using it](#using-it)
 - [Building](#building)
 - [Testing](#testing)
@@ -31,27 +35,75 @@ RethinkDNS is a `VpnService`. Every packet the app wants to inspect is routed in
 device, handed to the Go firewall/DNS engine, and only then decided on. That design is what
 makes the app work without root — but it has a cost:
 
+* **The system owns the tunnel.** `VpnService.establish()` asks `system_server` to create
+  the interface, publish a VPN network and repoint every resolver at it. The key icon goes
+  up, `protect()` becomes mandatory for our own sockets, and connectivity callbacks arrive
+  through the VPN subsystem's own timing.
 * **Blocked traffic still travels the whole stack.** A denied connection is written into
   the tun, read by firestack, turned into a Kotlin decision, logged, persisted, and only
   then dropped. The CPU has to wake up for traffic that was never going to succeed.
-* **The app must poll, because nobody tells it anything.** It owns the tun, so it has to
-  re-verify connectivity on a timer, re-flush its own log batches, re-ping its own proxies
-  and re-derive its own drop counts — all at fixed, fairly aggressive intervals.
-* **Wakelocks and wakeups add up.** Each of those timers is an alarm that can pull the SoC
-  out of a low-power state.
+* **The app must poll, because nobody tells it anything.** It re-verifies connectivity on a
+  timer, re-flushes its own log batches, re-pings its own proxies and re-derives its own
+  drop counts — all at fixed, fairly aggressive intervals, each one a wakeup.
 
-Root changes the trade. The kernel can drop a denied packet in `OUTPUT` before it is ever
-written to tun, and the platform can deliver connectivity changes to a registered receiver
-instead of the app having to ask for them. This fork exploits exactly those two facts.
+Root changes the trade. The kernel can open `/dev/net/tun` for us, mark and drop packets
+before they ever reach the app, and the platform can deliver connectivity changes to a
+registered receiver instead of the app having to ask for them. This fork exploits all of
+those facts.
 
 ---
 
 ## What root mode does
 
-Everything lives in one new package: **`com.celzero.bravedns.root`** (5 source files,
-~710 lines, plus ~950 lines of unit tests).
+Most of it lives in one package: **`com.celzero.bravedns.root`** — seven source files,
+~1,350 lines, plus ~1,100 lines of unit tests.
 
-### 1. Kernel-level firewall offload
+### 1. A tun device the app owns — no VPN
+
+When root is available, the app **does not register a VPN with the system at all**. Instead:
+
+1. A tiny compiled helper, **`rtn`** (C, `app/src/main/cpp/rtn.c`, 182 lines, shipped
+   prebuilt for each ABI under `app/src/main/assets/rtn/<abi>/rtn`), is executed as root.
+   It opens `/dev/net/tun`, creates `rtn0` and sends the file descriptor back over an
+   abstract `AF_UNIX` socket with `SCM_RIGHTS`.
+2. `RootTunManager` receives that descriptor and **keeps one copy open for the lifetime of
+   the service**, so the interface cannot disappear when the upstream adapter detaches and
+   hands its own copy to firestack. Every `establish()` returns a fresh `dup`, so the
+   ownership rules downstream (detach, hand to firestack, close) are exactly what they were
+   when the descriptor came from a real VPN.
+3. `RootTunPlanner` reproduces the four things `VpnService.establish()` gives away for
+   free, with plain `ip`/`iptables` calls:
+
+   | What the VPN did | What root mode does |
+   | --- | --- |
+   | Create the tun and set its addresses | `ip link set` / `ip address replace` on `rtn0` |
+   | `addRoute()` into the system's routing table | the same routes in **table 50**, selected by an `fwmark` rule at **priority 9000** (above netd's first rule at 10000) |
+   | `protect()` our own sockets | a `--uid-owner <self> -j RETURN` at the front of the mangle `RETHINK_MARK` chain — our packets are never marked, so they never match the rule |
+   | `addDnsServer()` — repoint the whole OS at the tunnel | the device's **current** resolvers are routed into table 50, so queries keep the destination the app asked for and replies keep the source address the app expects |
+
+   Everything else is marked `0xF0000000` in mangle `OUTPUT` and therefore lands in the
+   tunnel. The mark uses the top nibble, outside every mask netd uses for network ids, so
+   it cannot collide with the bits the platform cares about.
+
+**What the user sees:** no VPN key icon in the status bar (nothing was registered as a
+VPN), no VPN network for the OS to route around, and no `VpnService.protect()` work on the
+data path. The one-time Android “Connection request” dialog still appears, because the app
+still starts a `VpnService` — it just never calls `establish()`.
+
+**Helper execution fallback.** Some root builds refuse to execute a file the app owns
+(SELinux labels everything under `filesDir` as `app_data_file`). `RootTunManager` proves
+the helper runs as root before it depends on it; if it does not, root re-copies it into a
+`/data/local/tmp/rtn-<uid>/` directory that root creates `0700` and owns — nothing any
+other app may have planted there can survive — and probes again. If *both* fail, root tun
+mode is abandoned and the normal VPN path takes over.
+
+**DNS has no NAT stage.** An earlier draft DNAT-ed every DNS packet to the tunnel address.
+That chain is dead code: the mangle exemptions (our uid, bypass uids, loopback, `rtn0`,
+already-marked) are a strict superset of what the nat chain exempted, so the DNAT could
+never fire. Routing the resolvers in (`routeSetup`) is the whole mechanism, and it is the
+one that preserves reply source addresses.
+
+### 2. Kernel-level firewall offload
 
 When root is available, the app installs a dedicated iptables/ip6tables chain:
 
@@ -82,11 +134,7 @@ Dropped-packet accounting stays cheap: one batched `iptables -L RETHINK_OUT -vnx
 per polling cycle (`-Z` zeroes the counters as it reads them), parsed by
 `RootFirewallPlanner.parseCounters()`.
 
-The **tun device itself is not replaced.** The `VpnService` still establishes the tun and
-still hands the fd to firestack; only the *denial* path is short-circuited. See
-[What stays in the tunnel](#what-stays-in-the-tunnel-and-why) for why.
-
-### 2. Rule lifecycle that survives crashes
+### 3. Rule lifecycle that survives crashes
 
 `RootRuntime` is a small state machine over a `CommandRunner` interface:
 
@@ -101,7 +149,7 @@ Activation always flushes first, so rules written by a previous process can neve
 it. Root detection (`RootDetector`) caches a **grant for 5 minutes** and a **denial for
 30 minutes**, so a device without root is not re-probed on every tunnel restart.
 
-### 3. Power profile
+### 4. Power profile
 
 Polling intervals were hard-coded constants scattered across subsystems. They are now read
 from a single `PowerProfile`, selected by the `PowerGovernor` singleton:
@@ -125,44 +173,47 @@ Two deliberate choices:
 * **The `vpn` profile is byte-for-byte today’s behaviour.** Existing tests
   (`ConnectionMonitorTest` and friends) assert those exact constants, and non-root users
   see no change whatsoever.
-* **Root intervals are deliberately *not* multiples of each other** (61 s, 307 s, 307 s…
-  90 s), so the polling phases drift apart instead of lining up and waking the CPU in a
-  single burst.
+* **Root intervals are deliberately *not* multiples of each other** (61 s, 307 s, 90 s…),
+  so the polling phases drift apart instead of lining up and waking the CPU in a single
+  burst.
 
 Consumers were changed to read the profile instead of a literal:
 `ConnectionMonitor`, `GlobalProxyHandler`, `WgProxyPingController`, `NetLogBatcher`,
 `PauseTimer`.
 
-### 4. A switch in the UI
+### 5. A switch in the UI
 
 **Settings → Tunnel settings → “Root mode”** (default **on**).
 
 * On: the service probes for root when the tunnel starts. If root is granted, the kernel
-  firewall and the root power profile are activated. If it is **not** granted, the app logs
-  `root mode requested but unavailable; using tun firewall`, restores the non-root profile
-  and continues exactly as upstream does.
-* Off: root is never probed, the chain is torn down if present, and the non-root profile is
-  used.
+  firewall and the root power profile are activated, and the tun is taken from root rather
+  than from the system. If it is **not** granted, the app logs
+  `root mode requested but unavailable; using tun firewall` / `root tun unavailable (…);
+  using VpnService.establish()`, restores the non-root profile and continues exactly as
+  upstream does.
+* Off: root is never probed, the chain and the root routing rules are torn down, and the
+  non-root profile is used.
 
 The preference is persisted as `root_mode_enabled` (`PersistentState.rootModeEnabled`).
+Flipping it raises `vpnRestartTrigger`, so the tunnel is rebuilt with the other
+implementation immediately rather than at the next incidental restart.
 
 ---
 
-## What stays in the tunnel, and why
+## What still runs in the Go engine
 
-The tun device and the `VpnService` are **not** removed. This is intentional:
+The tun device is now opened by root, but **it is still handed to firestack**. The Go
+engine keeps doing DNS, proxying, per-domain rules and every network/screen/domain
+conditional verdict — byte-for-byte the same code as upstream. What changed is only *who
+created the interface and how packets get into it*.
 
-1. **SELinux blocks apps from opening `/dev/net/tun`.** The fd must come from
-   `VpnService.establish()` via `system_server`.
-2. **firestack needs that fd.** `Intra.connect(tunfd, …)` is what runs the DNS, firewall
-   verdicts and proxying. Passing the fd over a `SCM_RIGHTS` socket to a root helper was
-   evaluated and deliberately dropped: it is a large, fragile change to the hot path for a
-   benefit that does not survive contact with SELinux.
+Equally unchanged:
 
-So root mode in this fork means **“offload the parts that root makes cheap”** — denials,
-accounting and polling cadence — not “re-implement the tunnel as a root firewall”. DNS,
-proxying, per-domain rules and everything network/screen/domain-conditional continue to
-work exactly as before.
+* **The non-root path is untouched.** With root mode off, or root unavailable, the code
+  falls through to `VpnService.establish()` and behaves exactly like upstream.
+* **Rule selection stays in Kotlin.** The kernel only ever sees unconditional denials.
+* **The one descriptor is handed out as a `dup`**, so downstream detach/close semantics
+  are identical in both modes.
 
 ---
 
@@ -172,11 +223,13 @@ work exactly as before.
    signed with the Android debug keystore).
 2. First run: skip the welcome pages and the tour.
 3. Tap **START** → accept the Android “Connection request” dialog → the app shows
-   **PROTECTED**.
-4. **Settings → Tunnel settings → Root mode** to enable/disable the root path.
-5. If the device has a working `su`, the tunnel log will show the root firewall engaging.
-   If it does not, you will see the fallback message and the app behaves exactly like
-   upstream.
+   **PROTECTED**. With root granted there is **no key icon** — the tunnel is `rtn0`,
+   owned by the app.
+4. **Settings → Tunnel settings → Root mode** to enable/disable the root path. Toggling it
+   rebuilds the tunnel straight away.
+5. If the device has a working `su`, `adb logcat` will show `root tun established, …` and
+   `rootFirewall` engaging. If it does not, you will see the fallback messages and the app
+   behaves exactly like upstream.
 
 ---
 
@@ -192,7 +245,6 @@ Requirements:
 | compileSdk / targetSdk | 37 |
 | minSdk | 23 |
 | NDK | 28.2.13676358 |
-| CMake | 3.22.1 |
 
 `local.properties` must point at your SDK:
 
@@ -205,6 +257,13 @@ sdk.dir=/path/to/Android/Sdk
 ```sh
 ./gradlew :app:testFdroidFullDebugUnitTest
 ./gradlew :app:assembleFdroidFullDebug
+```
+
+### Lint (CI gate; `abortOnError = true`)
+
+```sh
+./gradlew :app:lintFdroidFullDebug
+# 0 errors, 0 fatal
 ```
 
 ### Optimised (R8) APK, signed with the debug keystore
@@ -220,6 +279,18 @@ sdk.dir=/path/to/Android/Sdk
 
 Outputs land in `app/build/outputs/apk/fdroidFull/<buildType>/`.
 
+### The `rtn` helper
+
+The helper is plain C with no dependencies beyond bionic, so it needs no CMake — one clang
+invocation per ABI:
+
+```sh
+app/src/main/cpp/build.sh        # NDK=... optional, falls back to local.properties
+```
+
+It writes `app/src/main/assets/rtn/<abi>/rtn` and is reproducible: rebuilding with the NDK
+above produces byte-identical binaries to the ones checked in.
+
 > **Tip:** long Gradle invocations are best launched detached so they are not killed by a
 > shell timeout:
 > `(setsid nohup ./gradlew :app:testFdroidFullDebugUnitTest > /tmp/test.log 2>&1 < /dev/null &)`
@@ -228,27 +299,28 @@ Outputs land in `app/build/outputs/apk/fdroidFull/<buildType>/`.
 
 ## Testing
 
-### Unit tests — **1301 tests, 68 classes, 0 failures**
+### Unit tests — **1319 tests, 69 classes, 0 failures**
 
 ```text
 ./gradlew :app:testFdroidFullDebugUnitTest
 BUILD SUCCESSFUL
-1301 tests, 0 failed, 68 classes
+1319 tests, 0 failed, 69 classes
 ```
 
-Baseline upstream snapshot (first commit) was **1229 tests / 5 failures**:
+Baseline upstream snapshot (first commit) was **1229 tests / 68 classes, 5 failures**:
 three JVM out-of-memory failures and two pre-existing test bugs. All five are fixed below,
-and this fork adds **72 new tests** across five new classes:
+and this fork adds **90 new tests** across six new classes:
 
-| Test class | Covers |
-| --- | --- |
-| `RootFirewallPlannerTest` | hook/flush/install/diff command generation, `-Z` counter parsing |
-| `RootFirewallPolicyTest` | which uids are (and are not) eligible for offload |
-| `RootPowerProfileTest` | `vpn()` equals the historical constants; `root()` values |
-| `RootRuntimeTest` | activate / sync / counters / deactivate state machine, stale-rule flush |
-| `RootDetectorTest` | `su` probe, 5 min grant cache, 30 min denial cache |
+| Test class | Tests | Covers |
+| --- | ---: | --- |
+| `RootTunPlannerTest` | 18 | link/route/mangle command generation, table-50 flush, fwmark rule id, resolver routing, teardown idempotence, **no nat rules at all** |
+| `RootFirewallPlannerTest` | 19 | hook/flush/install/diff command generation, `-Z` counter parsing |
+| `RootFirewallPolicyTest` | 14 | which uids are (and are not) eligible for offload |
+| `RootPowerProfileTest` | 9 | `vpn()` equals the historical constants; `root()` values |
+| `RootRuntimeTest` | 20 | activate / sync / counters / deactivate state machine, stale-rule flush |
+| `RootDetectorTest` | 10 | `su` probe, 5 min grant cache, 30 min denial cache |
 
-Two pre-existing test failures were fixed along the way:
+Pre-existing test failures were fixed along the way:
 
 * `RpnProxyManagerTest` — missing `AppConfig` registration (`appConfig$delegate` was never
   stubbed).
@@ -294,7 +366,7 @@ On the same emulator, with the built APK:
 
 ### Kernel rule validation (real `iptables`)
 
-Every command the planner generates was executed as root against Android’s own
+Every command the firewall planner generates was executed as root against Android’s own
 `iptables v1.8.10 (legacy)` and `ip6tables` on the emulator:
 
 | Command | Result |
@@ -307,11 +379,59 @@ Every command the planner generates was executed as root against Android’s own
 | `removeHook` (`-D OUTPUT`, `-F`, `-X`) | chain gone, hook absent |
 | `ip6tables` same chain name | accepted |
 
+The `ip`/mangle commands in `RootTunPlanner` are unit-tested for shape and idempotence
+(`RootTunPlannerTest`) and, as of this revision, have also been executed for real on a
+rooted image — see the next section.
+
+### Root tun + per-app firewall — verified end-to-end (rooted emulator)
+
+Everything above ran on an Android 35 `google_apis` x86_64 emulator where the app *is*
+granted root (`/system/xbin/su`). Traffic was generated with a tiny on-device probe that
+performs a DNS lookup and an HTTP fetch **as an arbitrary uid**, so the firewall could be
+observed acting on a specific app rather than on `adb shell`.
+
+| Check | Result |
+| --- | --- |
+| `rtn0` created by the `rtn` helper, `UP`, `10.111.222.1/24` | pass |
+| `9000: from all fwmark 0xf0000000/0xf0000000 lookup 50` in `ip rule` | pass |
+| `ip route show table 50` = `default dev rtn0` + the device's resolvers | pass |
+| DNS **through** the tunnel, as root *and* as a non-privileged app uid | `NOERROR`, 2 answers |
+| HTTP/TCP **through** the tunnel as an app uid | `HTTP/1.1 200 OK`, body delivered |
+| No VPN key icon, no system-owned `tun0`/`tun1` | pass |
+
+**Per-app firewall, A/B.** With `org.chromium.webview_shell` (uid 10111) in the
+foreground, the probe is run twice:
+
+| `AppInfo.connectionStatus` for uid 10111 | `RETHINK_OUT` | probe as 10111 | probe as `adb shell` |
+| --- | --- | --- | --- |
+| `ALLOW` (3) | *(empty)* | `HTTP/1.1 200 OK` | `HTTP/1.1 200 OK` |
+| `BOTH` (0) | `-A RETHINK_OUT -m owner --uid-owner 10111 -j DROP` | `connect: Operation now in progress` (SYN dropped) | `HTTP/1.1 200 OK` |
+
+The blocked app's packets are stopped by the **kernel**, never reaching the tun, the Go
+engine or Kotlin — which is the whole point of the offload. Reverting the rule and
+restarting the tunnel removes the stale `DROP`: `activate()` runs `reset()` (hook + flush)
+before anything is installed, so even a process killed with the rule armed comes back
+clean.
+
+### Known limitations of root mode
+
+* **The tun path cannot attribute a flow to an app.** firestack hands the flow to Kotlin
+  with `uid = -1` and the `ConnectivityManager.getConnectionOwnerUid` fallback does not
+  resolve it either, so you will see `preflow: returning uid: -1` in logcat. This does
+  *not* affect blocking: unconditional per-app denials never reach the tun, they are
+  dropped by uid in `RETHINK_OUT`. It does affect *conditional* verdicts (metered /
+  unmetered, per-app IP and domain rules), which fall back to the tun path, and it means
+  connection logs cannot name the app behind a flow.
+* **ICMP is not answered.** `ping` resolves its name through the tunnel but receives no
+  echo replies. TCP and UDP are unaffected (verified above).
+* **Kernel drop counters are consumed by the app.** `counters()` reads with `-Z`, so a
+  bare `iptables -L RETHINK_OUT` between two polls prints `0` even right after a drop.
+
 ---
 
 ## Release APKs
 
-Published as GitHub Releases, tagged (e.g. `v1.0.0`).
+Published as GitHub Releases, tagged (e.g. `v1.0.0`, `v1.1.0`).
 
 | APK | ABI |
 | --- | --- |
@@ -322,7 +442,7 @@ Published as GitHub Releases, tagged (e.g. `v1.0.0`).
 | `app-fdroid-full-universal-*.apk` | all of the above |
 
 The `fdroid` flavor is **de-Googled**: no Firebase, no Google Play Services. `versionName`
-comes from `git describe --tags`, so it matches the release tag.
+comes from `git describe --tags`, so **tag before building** and it matches the release tag.
 
 Install with `adb install <apk>` or from a file manager.
 
@@ -330,22 +450,41 @@ Install with `adb install <apk>` or from a file manager.
 
 ## Verifying the root behaviour yourself
 
-With a rooted device (or an emulator where the app can obtain root):
+With a rooted device (or an emulator where the app can obtain root), start the tunnel with
+Root mode on, then:
 
 ```sh
-# chain exists and is hooked before OUTPUT starts dropping
-adb shell su -c 'iptables -w -L RETHINK_OUT -vnx'
+# the tunnel interface exists and owns the builder's address
+adb shell su -c 'ip -br addr show rtn0'
 
-# your uid should be present only if it was unconditionally denied
+# the builder's routes and the system resolvers are in table 50,
+# selected by our fwmark rule at priority 9000
+adb shell su -c 'ip route show table 50'
+adb shell su -c 'ip rule show'
+
+# everything except our uid is marked; protect() is the first RETURN
+adb shell su -c 'iptables -w -t mangle -L RETHINK_MARK -vnx'
+
+# the kernel firewall chain (only unconditional denials appear here)
+adb shell su -c 'iptables -w -L RETHINK_OUT -vnx'
 adb shell su -c 'iptables -w -L RETHINK_OUT -vnx | grep "owner UID match"'
 
-# the app's own log line when root is granted (vs the fallback message)
-adb logcat -d | grep -E 'root mode|rootFirewall'
+# per-app firewall: block an app in the app's firewall UI, then drive traffic as
+# that uid and watch it fail while another uid still succeeds
+adb shell 'su --as <uid> -c "probe http example.com /"'   # -> connect hangs
+adb shell 'probe http example.com /'                      # -> HTTP/1.1 200 OK
+# unblock, restart the tunnel: activate() flushes first, the DROP rule is gone
+
+# the app's own log lines
+adb logcat -d | grep -E 'root tun|root mode|rootFirewall'
 ```
 
-Tearing the tunnel down should leave **no** `RETHINK_OUT` chain and **no** jump in
-`OUTPUT`; activation always flushes first, so even a crash leaves nothing behind after the
-next start.
+What you should **not** see with root granted: a VPN key icon in the status bar, or a
+`tun0`/`tun1` owned by the system.
+
+Tearing the tunnel down should leave **no** `rtn0`, **no** `ip rule`, **no** `RETHINK_MARK`
+chain and **no** `RETHINK_OUT` chain. Activation always flushes first, so even a crash
+leaves nothing behind after the next start.
 
 ---
 
@@ -358,15 +497,18 @@ next start.
 * **No root → no behaviour change.** The probe fails fast (cached for 30 minutes), the app
   logs the fallback, the power profile reverts to `vpn`, and the app is byte-for-byte the
   upstream experience.
-* **Rollback is one switch.** Turning Root mode off calls `deactivate()`, which removes the
-  chain and the hook and restores the non-root profile. Even if that fails, the next
-  activation flushes.
-* **The tun device is unchanged**, so DNS, proxying and per-domain rules keep working in
-  both modes.
-* **Limitations:** the offload path has been validated against real Android `iptables` and
-  unit-tested end-to-end over a fake command runner, but *not* exercised on a genuinely
-  rooted device in this repository’s CI — no rooted hardware was available. The only thing
-  untested there is the last mile (`su` actually granting); everything behind it is.
+* **Every root tun failure falls back to the real VPN.** No root, no `su`, a `su` build
+  that will not run our binary, a SELinux denial, a helper timeout, a routing failure — all
+  return null, tear the root routing rules down *before* `VpnService.establish()` runs (the
+  two path selections must never overlap, or traffic would silently split), and the app
+  keeps working as a normal VPN.
+* **Rollback is one switch.** Turning Root mode off tears down `RETHINK_OUT`,
+  `RETHINK_MARK`, table 50 and the fwmark rules and restores the non-root profile. Even if
+  that fails, the next activation flushes.
+* **Limitations of root mode** are listed under
+  [Known limitations of root mode](#known-limitations-of-root-mode): the tun path cannot
+  name the app behind a flow (`uid = -1`), ICMP is not answered, and the kernel drop
+  counters are drained by the app's own poll.
 * **Debug-key signature.** Release APKs are signed with the Android debug keystore, so they
   are not upgrade-compatible with a Play Store / F-Droid install of upstream.
 
@@ -378,18 +520,28 @@ next start.
 app/src/main/java/com/celzero/bravedns/
 ├── root/
 │   ├── RootShell.kt             ShellResult, CommandRunner, ProcessCommandRunner,
-│   │                            RootState, RootDetector (su probe + TTL cache)
+│   │                            RootState, RootDetector (su probe + TTL cache);
+│   │                            API-23-safe process wait/destroy
+│   ├── RootTunManager.kt        tun descriptor via rtn helper (SCM_RIGHTS), helper
+│   │                            extraction/probe/fallback install, configure/teardown
+│   ├── RootTunPlanner.kt        Pure command strings: linkSetup, routeSetup (table 50),
+│   │                            mangleSetup (protect() replacement), teardown
 │   ├── RootFirewallPlanner.kt   Pure command strings: ensureHook, flush, diff,
 │   │                            parseCounters, removalScript
 │   ├── RootFirewallPolicy.kt    Pure uid selection: only unconditional denials
 │   ├── RootPowerProfile.kt      PowerProfile.vpn() / root() + PowerGovernor
 │   └── RootRuntime.kt           activate / sync / counters / deactivate state machine
-├── service/BraveVPNService.kt   Wiring: startRootRuntime, syncRootFirewall, builder
-│                                exclusion recording, pref listener, counter poll
+├── service/BraveVPNService.kt   Wiring: startRootRuntime, syncRootFirewall, rootTunEstablish,
+│                                releaseRootTun, protectUnderlying, onDestroy, pref listener
 ├── service/PersistentState.kt   root_mode_enabled preference
 └── ui/activity/TunnelSettingsActivity.kt  + activity_tunnel_settings.xml  Toggle UI
 
-app/src/test/java/com/celzero/bravedns/root/   5 unit-test classes (72 tests)
+app/src/main/cpp/
+├── rtn.c                        Helper: open /dev/net/tun, create rtn0, send the fd
+├── build.sh                     One clang per ABI → ../assets/rtn/<abi>/rtn
+app/src/main/assets/rtn/<abi>/rtn  Prebuilt helpers (byte-reproducible via build.sh)
+
+app/src/test/java/com/celzero/bravedns/root/   6 unit-test classes (88 tests)
 app/src/test/java/com/celzero/bravedns/…       2 upstream test fixes
 ```
 
@@ -402,5 +554,5 @@ app/src/test/java/com/celzero/bravedns/…       2 upstream test fixes
 * **[firestack](https://github.com/celzero/firestack)** — the Go tunnel/DNS/firewall core.
 * **[WireGuard for Android](https://www.wireguard.com/)** — tunnel implementation.
 
-This fork only adds the root execution path, the power profile and the tests described
-above; every other line is upstream work.
+This fork only adds the root execution path, the root tun, the power profile and the tests
+described above; every other line is upstream work.

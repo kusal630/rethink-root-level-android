@@ -84,8 +84,10 @@ import com.celzero.bravedns.receiver.NotificationActionReceiver
 import com.celzero.bravedns.receiver.UserPresentReceiver
 import com.celzero.bravedns.root.PowerGovernor
 import com.celzero.bravedns.root.ProcessCommandRunner
+import com.celzero.bravedns.root.RootDetector
 import com.celzero.bravedns.root.RootFirewallPolicy
 import com.celzero.bravedns.root.RootRuntime
+import com.celzero.bravedns.root.RootTunManager
 import com.celzero.bravedns.rpnproxy.RpnProxyManager
 import com.celzero.bravedns.rpnproxy.RpnProxyManager.RpnType
 import com.celzero.bravedns.scheduler.RpnProxyUpdateWorker
@@ -154,6 +156,7 @@ import inet.ipaddr.HostName
 import inet.ipaddr.IPAddressString
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineName
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
@@ -225,10 +228,24 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
     // Root mode: probes `su`, owns the OUTPUT drop chain and selects the active
     // PowerGovernor profile. Constructed (but never executed) lazily so that the whole
     // subsystem stays inert — and cheap — when root mode is switched off.
+    //
+    // One runner backs the detector, the firewall runtime and the tun manager so the
+    // `su` grant cache is shared rather than re-probed three times per restart.
+    private val rootShell: ProcessCommandRunner by lazy { ProcessCommandRunner() }
+    private val rootDetector: RootDetector by
+        lazy { RootDetector(rootShell, log = { Logger.i(LOG_TAG_VPN, it) }) }
     private val rootRuntime: RootRuntime by
-        lazy {
-            RootRuntime(ProcessCommandRunner(), log = { Logger.d(LOG_TAG_VPN, it) })
-        }
+        lazy { RootRuntime(rootShell, log = { Logger.d(LOG_TAG_VPN, it) }) }
+
+    // Root tun: with root granted the app opens /dev/net/tun itself instead of asking the
+    // system for a VPN, so there is no VPN indicator and the OS never owns our routing.
+    // Downstream nothing changes — the adapter still receives an ordinary tun descriptor
+    // and firestack runs exactly as it does in VPN mode.
+    private val rootTunManager: RootTunManager by
+        lazy { RootTunManager(this, rootShell, rootDetector) }
+
+    /** True while the tun descriptor in use came from [rootTunManager] rather than the system. */
+    @Volatile private var rootTunActive: Boolean = false
 
     // Snapshot of the routing decision made by the most recent newBuilder() run. The
     // kernel drop rules may only be installed for uids whose traffic actually reaches
@@ -414,7 +431,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
             return
         }
 
-        this.protect(fid.toInt())
+        protectUnderlying(fid.toInt())
 
         if (nws.isEmpty()) {
             Logger.w(LOG_TAG_VPN, "no network to bind, who: $who, fd: $fid, addr: $addrPort")
@@ -502,7 +519,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
     }
 
     fun protectFdForConnectivityChecks(fd: Long) {
-        this.protect(fd.toInt())
+        protectUnderlying(fd.toInt())
         Logger.v(LOG_TAG_CONNECTION, "fd($fd) protected for connectivity checks")
     }
 
@@ -573,7 +590,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
     }
 
     fun protectSocket(socket: Socket) {
-        this.protect(socket)
+        protectUnderlying(socket)
         Logger.v(LOG_TAG_VPN, "socket protected")
     }
 
@@ -594,7 +611,35 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
             Logger.vv(LOG_TAG_VPN, "protect: rinr, within rethink, who: $who, fd: $fd")
             return@go2kt
         }
-        this.protect(fd.toInt())
+        protectUnderlying(fd.toInt())
+    }
+
+    /**
+     * The addresses and routes the builder was last asked to install.
+     *
+     * `VpnService.Builder` has no getters, and root mode has to install the very same
+     * values with `ip` instead of letting the system install them for a registered VPN.
+     * Recording them at the single place routes are decided keeps one source of truth
+     * instead of a second, slowly drifting copy of addRoute4()/addRoute6().
+     *
+     * Cleared by [newBuilder], i.e. once per [establishVpn] run.
+     */
+    private val builderAddress: MutableList<String> = ArrayList()
+    private val builderRoute: MutableList<String> = ArrayList()
+
+    private fun Builder.recRoute(dst: String, prefixLength: Int): Builder {
+        builderRoute += "$dst/$prefixLength"
+        return addRoute(dst, prefixLength)
+    }
+
+    private fun Builder.recRoute(dst: InetAddress, prefixLength: Int): Builder {
+        builderRoute += "${dst.hostAddress}/$prefixLength"
+        return addRoute(dst, prefixLength)
+    }
+
+    private fun Builder.recAddress(addr: String, prefixLength: Int): Builder {
+        builderAddress += "$addr/$prefixLength"
+        return addAddress(addr, prefixLength)
     }
 
     /**
@@ -606,6 +651,8 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
      */
     private suspend fun newBuilder(): Builder {
         builderDisallowedAccum.clear()
+        builderAddress.clear()
+        builderRoute.clear()
         val builder = Builder()
         val underlyingNws = getUnderlays()
         // prefer view of underlying networks over vpn service lockdown state for being consistent
@@ -782,6 +829,22 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
                 Logger.i(LOG_TAG_VPN, "root mode requested but unavailable; using tun firewall")
             }
         }
+    }
+
+    /**
+     * `VpnService.protect()` is only meaningful for descriptors the system handed us as
+     * part of a VPN it knows about. In root mode no such VPN exists, so the call would be
+     * a no-op at best — and the mangle chain's `--uid-owner <self> -j RETURN` already
+     * keeps our own sockets out of the tunnel, which is exactly what protect() did.
+     */
+    private fun protectUnderlying(fd: Int) {
+        if (rootTunActive) return
+        this.protect(fd)
+    }
+
+    private fun protectUnderlying(socket: Socket) {
+        if (rootTunActive) return
+        this.protect(socket)
     }
 
     private fun stopRootRuntime() {
@@ -1699,6 +1762,11 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
                         PowerGovernor.select(root = false)
                         stopRootRuntime()
                     }
+                    // the descriptor itself changes hands too: root mode owns /dev/net/tun,
+                    // non-root mode owns VpnService.establish(). Restarting hands the tun to
+                    // the other owner (and tears the old one down) instead of leaving the
+                    // switch to take effect on the next unrelated restart.
+                    vpnRestartTrigger.value = "rootMode: ${persistentState.rootModeEnabled}"
                 }
             }
 
@@ -2169,12 +2237,17 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
         withContext(CoroutineName("stopVpn") + serializer) {
             if (vpnAdapter == null) {
                 Logger.i(LOG_TAG_VPN, "vpn adapter already stopped")
-                return@withContext
+            } else {
+                // unlink() releases the tun fd that netstack still holds after disconnect().
+                // Left open, it keeps the interface alive, and the next establish() gets
+                // EBUSY from TUNSETIFF — which silently drops us back to VpnService.
+                vpnAdapter?.unlink()
+                vpnAdapter?.closeTun()
+                vpnAdapter = null
+                Logger.i(LOG_TAG_VPN, "stop vpn adapter")
             }
 
-            vpnAdapter?.closeTun()
-            vpnAdapter = null
-            Logger.i(LOG_TAG_VPN, "stop vpn adapter")
+            releaseRootTun("vpn stopped")
         }
 
     private suspend fun restartVpnWithNewAppConfig(reason: String) {
@@ -2537,7 +2610,8 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
 
         val underlyingNws = getUnderlays()
         withContext(Dispatchers.Main) {
-            setUnderlyingNetworks(underlyingNws)
+            // nothing to tell the system about when we own the tun ourselves
+            if (!rootTunActive) setUnderlyingNetworks(underlyingNws)
         }
         tunUnderlyingNetworks = underlyingNws?.joinToString()
 
@@ -2704,7 +2778,8 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
 
         val underlyingNws = getUnderlays()
         withContext(Dispatchers.Main) {
-            setUnderlyingNetworks(underlyingNws)
+            // nothing to tell the system about when we own the tun ourselves
+            if (!rootTunActive) setUnderlyingNetworks(underlyingNws)
         }
         tunUnderlyingNetworks = underlyingNws?.joinToString()
         var ipv4Ssid = ""
@@ -3205,6 +3280,19 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
         persistentState.setVpnEnabled(false)
         stopPauseTimer()
         stopRootRuntime()
+        // The root tun must not outlive the service: vpnScope is cancelled below, and the
+        // io() release queued by signalStopService() is a child of it, so a stop that races
+        // with onDestroy would leave the routing rules installed. Release on a scope that
+        // does not care about vpnScope; when nothing is held this is a no-op.
+        if (rootTunManager.isUp()) {
+            CoroutineScope(Dispatchers.IO).launch {
+                try {
+                    releaseRootTun("service destroyed")
+                } catch (e: Exception) {
+                    Logger.w(LOG_TAG_VPN, "root tun release on destroy failed: ${e.message}")
+                }
+            }
+        }
         // reset the underlying networks
         underlyingNetworks = null
         // reset the observer-tracked network set (observer is already stopped by now)
@@ -3438,6 +3526,13 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
             s.append("mtu: $mtu\n   has4: $has4\n   has6: $has6\n   noRoutes: $noRoutes\n   dnsMode? $dnsMode\n   firewallMode? $firewallMode")
             builderStats = s.toString()
 
+            // Root mode: take the tun ourselves instead of registering a VPN with the
+            // system. Any failure here returns null and falls through to the normal
+            // VpnService path, so root being flaky can never leave the user unprotected.
+            rootTunEstablish(mtu)?.let {
+                return it
+            }
+
             val establish = withContext(Dispatchers.Main) {
                 builder.establish()
             }
@@ -3446,6 +3541,101 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
             Logger.crash(LOG_TAG_VPN, e.message ?: "err establishVpn", e)
             return null
         }
+    }
+
+    /**
+     * Asks [rootTunManager] for the tun descriptor, or returns null when root mode is
+     * off / unavailable and the caller should use `VpnService.establish()` instead.
+     *
+     * Everything handed over is taken straight from what the builder was just asked to
+     * do, so the root path routes exactly what the VPN path would have routed — no more,
+     * no less.
+     */
+    private suspend fun rootTunEstablish(mtu: Int): ParcelFileDescriptor? {
+        if (!persistentState.rootModeEnabled) {
+            releaseRootTun("root mode switched off")
+            return null
+        }
+
+        val spec =
+            RootTunManager.TunSpec(
+                addresses = builderAddress.toList(),
+                routes = builderRoute.toList(),
+                systemDns = systemDnsServers(),
+                mtu = mtu,
+                selfUid = Process.myUid(),
+                bypassUids = uidsOf(builderDisallowedAccum),
+            )
+
+        val pfd = rootTunManager.establish(spec)
+        if (pfd == null) {
+            // never leave the root routing rules behind while the system VPN takes over:
+            // two overlapping path selections would silently split the traffic
+            releaseRootTun(rootTunManager.lastError())
+            Logger.w(
+                LOG_TAG_VPN,
+                "root tun unavailable (${rootTunManager.lastError()}); using VpnService.establish()",
+            )
+            return null
+        }
+        rootTunActive = true
+        Logger.i(
+            LOG_TAG_VPN,
+            "root tun established, addrs=${spec.addresses.size} routes=${spec.routes.size} dns=${spec.systemDns}",
+        )
+        return pfd
+    }
+
+    /**
+     * Undoes root tun mode: marks the active descriptor as gone and, if the manager still
+     * holds one, removes the mangle chain, the policy rules and the routes. Idempotent,
+     * and safe to call from any path that decides to fall back to `VpnService.establish()`.
+     */
+    private suspend fun releaseRootTun(why: String?) {
+        val wasActive = rootTunActive
+        rootTunActive = false
+        if (!rootTunManager.isUp()) {
+            if (wasActive) Logger.i(LOG_TAG_VPN, "root tun released ($why)")
+            return
+        }
+        // awaited, not fire-and-forget: the caller may be about to establish a system VPN
+        // and the two must never overlap
+        withContext(Dispatchers.IO) { rootTunManager.teardown() }
+        Logger.i(LOG_TAG_VPN, "root tun released ($why)")
+    }
+
+    /**
+     * The device's current resolvers. Route-only, loopback excluded: a stub on 127.0.0.1
+     * is somebody else's business and must never be pulled into the tunnel.
+     */
+    private fun systemDnsServers(): List<String> {
+        val lp =
+            try {
+                cm.getLinkProperties(cm.activeNetwork)
+            } catch (e: Exception) {
+                Logger.w(LOG_TAG_VPN, "dns servers: ${e.message}")
+                null
+            }
+        return lp?.dnsServers
+            ?.mapNotNull { it.hostAddress }
+            ?.filter { addr ->
+                // a zone-scoped or unparseable entry is not a routable destination
+                !addr.contains('%') &&
+                    runCatching { !InetAddress.getByName(addr).isLoopbackAddress }
+                        .getOrDefault(false)
+            }
+            ?: emptyList()
+    }
+
+    private fun uidsOf(pkgs: Set<String>): Set<Int> {
+        if (pkgs.isEmpty()) return emptySet()
+        return pkgs.mapNotNull { pkg ->
+            try {
+                packageManager.getApplicationInfo(pkg, 0).uid
+            } catch (e: Exception) {
+                null
+            }
+        }.toSet()
     }
 
     private fun route6(nws: Networks): Boolean {
@@ -3600,17 +3790,17 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
             // range 0000:0000:0000:0000:0000:0000:0000:0000-
             // 0000:0000:0000:0000:ffff:ffff:ffff:ffff
             // fixme: see if the ranges overlap with the default route
-            b.addRoute("0000::", 64)
-            b.addRoute("2000::", 3) // 2000:: - 3fff::
-            b.addRoute("4000::", 3) // 4000:: - 5fff::
-            b.addRoute("6000::", 3) // 6000:: - 7fff::
-            b.addRoute("8000::", 3) // 8000:: - 9fff::
-            b.addRoute("a000::", 3) // a000:: - bfff::
-            b.addRoute("c000::", 3) // c000:: - dfff::
-            b.addRoute("e000::", 4) // e000:: - efff::
-            b.addRoute("f000::", 5) // f000:: - f7ff::
-            b.addRoute("64:ff9b:1::", 48) // RFC8215/alg
-            b.addRoute("64:ff9b::", 96) // RFC6052/dns64
+            b.recRoute("0000::", 64)
+            b.recRoute("2000::", 3) // 2000:: - 3fff::
+            b.recRoute("4000::", 3) // 4000:: - 5fff::
+            b.recRoute("6000::", 3) // 6000:: - 7fff::
+            b.recRoute("8000::", 3) // 8000:: - 9fff::
+            b.recRoute("a000::", 3) // a000:: - bfff::
+            b.recRoute("c000::", 3) // c000:: - dfff::
+            b.recRoute("e000::", 4) // e000:: - efff::
+            b.recRoute("f000::", 5) // f000:: - f7ff::
+            b.recRoute("64:ff9b:1::", 48) // RFC8215/alg
+            b.recRoute("64:ff9b::", 96) // RFC6052/dns64
 
             // b.addRoute("f800::", 6) // unicast routes
             // b.addRoute("fe00::", 9) // unicast routes
@@ -3619,7 +3809,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
         } else {
             // no need to exclude LAN traffic, add default route which is ::/0
             Logger.i(LOG_TAG_VPN, "addRoute6: privateIps is false, adding default route")
-            b.addRoute(Constants.UNSPECIFIED_IP_IPV6, Constants.UNSPECIFIED_PORT)
+            b.recRoute(Constants.UNSPECIFIED_IP_IPV6, Constants.UNSPECIFIED_PORT)
         }
 
         return b
@@ -3656,7 +3846,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
                     val include = IPUtil.toCIDR(start, IPUtil.minus1(exclude.start)!!)
                     include?.forEach {
                         try {
-                            it.address?.let { it1 -> b.addRoute(it1, it.prefix) }
+                            it.address?.let { it1 -> b.recRoute(it1, it.prefix) }
                         } catch (ex: Exception) {
                             Logger.e(LOG_TAG_VPN, "exception while adding route: ${ex.message}", ex)
                         }
@@ -3674,28 +3864,28 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
                 val ipParts = gatewayIp4.split("/")
                 val gwIp4 = ipParts[0]
                 val prefixGwIp4 = ipParts[1].toIntOrNull() ?: 32
-                b.addRoute(HostName(gwIp4).toString(), prefixGwIp4)
+                b.recRoute(HostName(gwIp4).toString(), prefixGwIp4)
                 // dns
                 val customDns4 = persistentState.customLanDnsIpv4
                 val dnsIpParts = customDns4.split("/")
                 val dnsIp4 = dnsIpParts[0]
                 val prefixDnsIp4 = dnsIpParts[1].toIntOrNull() ?: 32
-                b.addRoute(HostName(dnsIp4).toString(), prefixDnsIp4)
+                b.recRoute(HostName(dnsIp4).toString(), prefixDnsIp4)
                 // router
                 val router4 = persistentState.customLanRouterIpv4
                 val routerIpParts = router4.split("/")
                 val routerIp4 = routerIpParts[0]
                 val prefixRouterIp4 = routerIpParts[1].toIntOrNull() ?: 32
-                b.addRoute(HostName(routerIp4).toString(), prefixRouterIp4)
+                b.recRoute(HostName(routerIp4).toString(), prefixRouterIp4)
             } else {
-                b.addRoute(LanIp.GATEWAY.make(IPV4_TEMPLATE), 32)
-                b.addRoute(LanIp.DNS.make(IPV4_TEMPLATE), 32)
-                b.addRoute(LanIp.ROUTER.make(IPV4_TEMPLATE), 32)
+                b.recRoute(LanIp.GATEWAY.make(IPV4_TEMPLATE), 32)
+                b.recRoute(LanIp.DNS.make(IPV4_TEMPLATE), 32)
+                b.recRoute(LanIp.ROUTER.make(IPV4_TEMPLATE), 32)
             }
         } else {
             Logger.i(LOG_TAG_VPN, "addRoute4: privateIps is false, adding default route")
             // no need to exclude LAN traffic, add default route which is 0.0.0.0/0
-            b.addRoute(Constants.UNSPECIFIED_IP_IPV4, Constants.UNSPECIFIED_PORT)
+            b.recRoute(Constants.UNSPECIFIED_IP_IPV4, Constants.UNSPECIFIED_PORT)
         }
 
         return b
@@ -3709,9 +3899,9 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
             // split the address and prefix length "$ip/$prefix"
             val ip4Parts = customIp.split("/")
             val ip4 = HostName(ip4Parts[0]).toString()
-            b.addAddress(ip4, ip4Parts[1].toIntOrNull() ?: IPV4_PREFIX_LENGTH)
+            b.recAddress(ip4, ip4Parts[1].toIntOrNull() ?: IPV4_PREFIX_LENGTH)
         } else {
-            b.addAddress(LanIp.GATEWAY.make(IPV4_TEMPLATE), IPV4_PREFIX_LENGTH)
+            b.recAddress(LanIp.GATEWAY.make(IPV4_TEMPLATE), IPV4_PREFIX_LENGTH)
         }
         return b
     }
@@ -3724,9 +3914,9 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
             // split the address and prefix length "$ip/$prefix"
             val ipParts = customIp.split("/")
             val ip6 = HostName(ipParts[0]).toString()
-            b.addAddress(ip6, ipParts[1].toIntOrNull() ?: IPV6_PREFIX_LENGTH)
+            b.recAddress(ip6, ipParts[1].toIntOrNull() ?: IPV6_PREFIX_LENGTH)
         } else {
-            b.addAddress(LanIp.GATEWAY.make(IPV6_TEMPLATE), IPV6_PREFIX_LENGTH)
+            b.recAddress(LanIp.GATEWAY.make(IPV6_TEMPLATE), IPV6_PREFIX_LENGTH)
         }
         return b
     }
@@ -3766,9 +3956,9 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
             Logger.i(LOG_TAG_VPN, "addDnsRoute4: using custom dns ip: $customDns")
             val ipParts = customDns.split("/")
             val ip = HostName(ipParts[0]).toString()
-            b.addRoute(ip, ipParts[1].toIntOrNull() ?: 32)
+            b.recRoute(ip, ipParts[1].toIntOrNull() ?: 32)
         } else {
-            b.addRoute(LanIp.DNS.make(IPV4_TEMPLATE), 32)
+            b.recRoute(LanIp.DNS.make(IPV4_TEMPLATE), 32)
         }
         return b
     }
@@ -3781,9 +3971,9 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Network
             Logger.i(LOG_TAG_VPN, "addDnsRoute6: using custom dns ip: $customDns")
             val ipParts = customDns.split("/")
             val ip = HostName(ipParts[0]).toString()
-            b.addRoute(ip, ipParts[1].toIntOrNull() ?: 128)
+            b.recRoute(ip, ipParts[1].toIntOrNull() ?: 128)
         } else {
-            b.addRoute(LanIp.DNS.make(IPV6_TEMPLATE), 128)
+            b.recRoute(LanIp.DNS.make(IPV6_TEMPLATE), 128)
         }
         return b
     }

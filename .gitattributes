@@ -3,3 +3,6 @@
 
 gradlew binary linguist-generated
 gradlew.bat binary linguist-generated
+
+# prebuilt rtn helper binaries must never be line-ending normalized
+app/src/main/assets/rtn/** binary
